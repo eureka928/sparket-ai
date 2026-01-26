@@ -1,0 +1,82 @@
+# Sparket configuration (example)
+#
+# Copy this file to one of the following locations (in order of discovery):
+#   - path from SPARKET_VALIDATOR_CONFIG_FILE or SPARKET_MINER_CONFIG_FILE (role-specific)
+#   - path from SPARKET_CONFIG_FILE (generic)
+#   - ./sparket/config/sparket.yaml (packaged default)
+#
+# IMPORTANT: Do not put secrets in this file. Use environment variables for secrets.
+#            Prefer DATABASE_URL or SPARKET_DATABASE__URL env for credentials.
+
+# Optional: role label for clarity in logs (validator|miner|base)
+role: validator
+
+chain:
+  # Keep minimal to avoid clashing with Bittensor CLI config
+  netuid: 1
+  # Optional explicit endpoint; if omitted, derived from subtensor.network
+  endpoint: null
+
+wallet:
+  # Bittensor wallet name to use (non-secret)
+  name: local-validator
+  # Hotkey name inside the wallet (non-secret)
+  hotkey: default
+
+subtensor:
+  # Network selector: finney | test | local (sets endpoint if chain_endpoint is not provided)
+  network: test
+  # Optional explicit chain endpoint override (wins over network mapping)
+  # chain_endpoint: wss://entrypoint-finney.opentensor.ai:443
+
+axon:
+  # Optional explicit bind/advertise override for the axon. Set host to 127.0.0.1 to keep localnet isolated.
+  # Validators default to 8093, miners default to 8094.
+  host: 127.0.0.1
+  port: 8093
+
+api:
+  # Announce a proxy URL instead of raw host/port (optional)
+  # proxy_url: https://your-tunnel.example.com
+  # Require miners to include a rotating token in pushes to the validator
+  require_push_token: true
+
+database:
+  # Prefer composing URL from discrete fields and secrets via env
+  # If url is omitted, and user/host/port/name are provided, it will be composed as:
+  #   postgresql+asyncpg://{user}:{password}@{host}:{port}/{name}
+  # Provide password via env: SPARKET_DATABASE__PASSWORD or DATABASE_URL
+  host: 127.0.0.1
+  port: 5432  # Default PostgreSQL port
+  user: sparket
+  name: sparket
+
+  # Connection pool (manager singleton defaults are tuned for ~50 concurrency)
+  pool_size: 50
+  max_overflow: 10
+  pool_timeout: 30
+  pool_recycle: 1800
+  echo: false
+
+  # Bootstrap and Dockerized Postgres (dev convenience)
+  bootstrap:
+    auto_create: true
+    # Optional superuser URL used to create role/database if missing
+    admin_url: null  # e.g., postgresql+asyncpg://postgres:admin@127.0.0.1:5432/postgres
+
+  docker:
+    enabled: true
+    image: postgres:18
+    port: 5432  # Default PostgreSQL port
+    container_name: pg-sparket
+    volume: pg_sparket_data
+
+
+
+timers:
+  # MVP cadence
+  fetch_interval_seconds: 60
+  score_interval_seconds: 120
+  publish_interval_seconds: 300
+
+

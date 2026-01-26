@@ -1,0 +1,62 @@
+# Sparket configuration for TEST MODE
+#
+# This configuration runs separate database instances for testing.
+# Use with: SPARKET_CONFIG_FILE=./sparket/config/sparket.test.yaml
+#
+# IMPORTANT: Do not put secrets in this file. Use environment variables.
+
+role: validator
+
+runtime:
+  test_mode: true
+
+chain:
+  netuid: 2
+  endpoint: ws://127.0.0.1:9945
+
+wallet:
+  name: local-validator
+  hotkey: default
+
+subtensor:
+  network: local
+
+axon:
+  host: 0.0.0.0
+  port: 8093
+
+api:
+  require_push_token: true
+
+database:
+  # Test mode uses separate database and container
+  host: 127.0.0.1
+  port: 5433  # Different port from production
+  user: sparket
+  name: sparket_test  # Different database name
+
+  pool_size: 20
+  max_overflow: 5
+  pool_timeout: 30
+  pool_recycle: 1800
+  echo: false
+
+  bootstrap:
+    auto_create: true
+    admin_url: null
+
+  docker:
+    enabled: true
+    image: postgres:18
+    port: 5433  # Production port
+    test_port: 5433  # Test port (same in test config)
+    container_name: pg-sparket-test
+    test_container_name: pg-sparket-test
+    volume: pg_sparket_test_data
+    test_volume: pg_sparket_test_data
+
+timers:
+  fetch_interval_seconds: 30
+  score_interval_seconds: 60
+  publish_interval_seconds: 120
+
