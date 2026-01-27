@@ -10,15 +10,12 @@ A validator is the scoring engine of the subnet. It:
 - Aggregates scores into rolling metrics and final SkillScore.
 - Emits weights back to the chain.
 
-## Minimum Requirements
+## Requirements
+### Hardware
 - 4 to 8 CPU cores
 - 32 GB RAM
 - 500 GB to 1 TB SSD
-- Reliable 100 Mbps uplink (minimum)
-- Ubuntu 24.04 LTS (or 22.04 LTS)
-- Python 3.10
-- Docker
-
+- Reliable 100 Mbps uplink
 
 ### Wallet and chain access
 - Bittensor CLI installed
@@ -41,36 +38,40 @@ validator. Instead, child hotkey to the Sparket team validator and
 delegate your stake there. This keeps the subnet consistent and avoids
 validators drifting on mismatched data.
 
-## Sportsdata.io Plan Details
-You will need to contact sportsdata.io and sign up for a plan which includes these specific products and leagues:
-- Competition Feeds:
-  - Standings, Rankings & Brackets
-  - Teams, Players & Rosters
-  - Venues & Officials
-  - Utility Endpoints
-- Event Feeds
-  - Schedules & Game Day Info
-- Betting Feeds
-  - Game Lines
-    - Pre-Game Lines
-    - Pre-Game Lines PLus
-
-Sports which you must have these products for:
-NFL, MLB, NBA, NHL, Soccer
-
-Please contact our team for help if you have issues with consensus or need clarity on which data products to purchase.
-
-
 ## Install
-From a clean host:
+
+### Prerequisites
+From a clean Ubuntu/Debian host, install system dependencies:
+```bash
+# Update packages
+sudo apt update && sudo apt upgrade -y
+
+# Install build essentials and git
+sudo apt install -y build-essential git curl
+
+# Install Node.js (required for pm2)
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
+
+# Install pm2 globally
+sudo npm install -g pm2
+
+# Install Docker (for managed Postgres)
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker $USER
+# Log out and back in for docker group to take effect
 ```
+
+### Clone and setup
+```bash
 git clone https://github.com/sparketlabs/sparket-subnet.git
 cd sparket-subnet
 ```
 
 Install uv and Python, then sync dependencies:
-```
+```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
+source ~/.bashrc  # or restart shell to get uv in PATH
 uv python install 3.10
 uv sync --dev
 ```
@@ -106,7 +107,7 @@ subtensor:
   chain_endpoint: ws://your-subtensor:9945
 
 chain:
-  netuid: 57
+  netuid: 2
 
 database:
   host: 127.0.0.1
@@ -125,40 +126,19 @@ validator:
   scoring_worker_fallback: true
 ```
 
-### 3) Optional proxy URL (IP Privacy)
-If you want to hide your validator's IP from the blockchain, use a proxy or tunnel
-(e.g., Cloudflare Tunnel, ngrok). When `proxy_url` is configured:
-
-1. **Your real IP is NOT registered to the chain** - the `axon.serve()` call is skipped
-2. **Miners receive the proxy URL** via periodic `CONNECTION_INFO_PUSH` broadcasts
-3. **The axon still accepts connections** on the local port for the proxy to forward to
-
-Set the proxy URL via environment variable or YAML:
-- `.env`: `SPARKET_API__PROXY_URL=https://your-proxy.example.com`
+### 3) Optional proxy URL
+If you front your validator with a proxy or tunnel, set:
+- `.env`: `SPARKET_API__PROXY_URL=https://your-proxy.example.com/axon`
 - `sparket/config/sparket.yaml`:
-```yaml
+```
 api:
-  proxy_url: https://your-proxy.example.com
+  proxy_url: https://your-proxy.example.com/axon
 ```
 
-**Example with Cloudflare Tunnel:**
+## First run (optional but recommended)
+Running once in the foreground helps verify your setup before handing off to pm2:
 ```bash
-# 1. Install cloudflared
-# 2. Create tunnel: cloudflared tunnel create sparket-validator
-# 3. Route: cloudflared tunnel route dns sparket-validator validator.yourdomain.com
-# 4. Run tunnel: cloudflared tunnel run --url http://localhost:8093 sparket-validator
-# 5. Set SPARKET_API__PROXY_URL=https://validator.yourdomain.com
-```
-
-When the validator starts with proxy mode, you'll see:
-```
-axon_proxy_mode: {enabled: true, proxy_url: "...", chain_registration: "skipped"}
-```
-
-## First run
-Run once in the foreground to bootstrap:
-```
-python sparket/entrypoints/validator.py
+uv run python sparket/entrypoints/validator.py
 ```
 
 This will:
@@ -166,17 +146,38 @@ This will:
 - Create the database if missing
 - Run migrations and seed reference data
 
-Stop it with Ctrl+C once you see the validator loop running.
+Stop it with Ctrl+C once you see the validator loop running and no errors.
+
+> **Note:** This step is optional. PM2 runs the same entrypoint and will
+> perform the bootstrap automatically. However, running interactively first
+> makes it easier to spot configuration errors.
 
 ## Run in production
 ### PM2 (recommended)
-```
+```bash
+# Start the validator
 pm2 start ecosystem.config.js --only validator-local
+
+# Watch logs to verify startup
 pm2 logs validator-local
+
+# Save process list so pm2 restarts on reboot
 pm2 save
+
+# Enable pm2 startup on boot
+pm2 startup
+# Follow the printed command (sudo env PATH=... pm2 startup ...)
 ```
 
 Logs live in `sparket/logs/pm2`.
+
+### Useful pm2 commands
+```bash
+pm2 status              # Check process status
+pm2 restart validator-local
+pm2 stop validator-local
+pm2 delete validator-local  # Remove from pm2
+```
 
 ### Systemd (optional)
 `scripts/ops/setup_validator.sh` writes a systemd unit at
@@ -185,16 +186,16 @@ and enable it if you prefer systemd.
 
 ## Multi-worker scoring
 The validator can offload scoring to worker processes. Increase
-`validator.scoring_worker_count` to match your CPU and RAM. Please reserve 2-4 cores for OS operations and the main application loop, so if you have a 12 core machine, we recommend ~6-8 workers. Future versions of this feature will include auto-optimization of worker count based on configurable resource limits, but for now you will need to manually adjust it.
- 
- If workers become
+`validator.scoring_worker_count` to match your CPU. If workers become
 unhealthy, `scoring_worker_fallback` keeps scoring in the main process.
 
 ## Upgrades
-```
+```bash
+cd sparket-subnet
 git pull
 uv sync --dev
 pm2 restart validator-local
+pm2 logs validator-local  # verify clean restart
 ```
 
 ## Troubleshooting

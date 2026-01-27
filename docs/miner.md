@@ -10,6 +10,131 @@ A miner:
 - Submits outcomes after events are settled.
 - Builds a track record that feeds SkillScore and emissions.
 
+## Miner-Validator Communication Flow
+
+Understanding the communication flow is essential for building a competitive miner.
+
+### 1. Connection Info Push (Validator → Miner)
+
+When your miner starts, it registers its axon on the chain. Validators
+periodically scan the metagraph and push connection info to active miners:
+
+```
+Validator                          Miner
+    |                                |
+    |---CONNECTION_INFO_PUSH-------->|
+    |   {                            |
+    |     "validator_hotkey": "...", |
+    |     "endpoint": "https://...", |
+    |     "push_token": "...",       |
+    |   }                            |
+    |                                |
+    |                                | (stores endpoint + token)
+```
+
+The miner stores this endpoint and uses it for all subsequent requests.
+The `push_token` rotates and must be included in submissions for validators
+that require it (`api.require_push_token: true`).
+
+### 2. Game Data Request (Miner → Validator)
+
+Once the miner has the validator endpoint, it can request available games:
+
+```
+Miner                              Validator
+    |                                |
+    |---GAME_DATA_REQUEST----------->|
+    |                                |
+    |<--games + markets--------------|
+```
+
+The response includes:
+- **Games**: event_id, team names, venue, start_time_utc, league/sport codes
+- **Markets**: market_id, kind (moneyline/spread/total), line value
+- **accepts_odds**: whether the 7-day submission window is open
+
+**Important**: The validator does NOT provide current odds or probabilities.
+Miners must generate their own predictions from their own data sources.
+
+### 3. Odds Submission (Miner → Validator)
+
+With game and market info, miners submit their price predictions:
+
+```
+Miner                              Validator
+    |                                |
+    |---ODDS_PUSH------------------->|
+    |   {                            |
+    |     "submissions": [{          |
+    |       "market_id": 123,        |
+    |       "kind": "moneyline",     |
+    |       "priced_at": "...",      |
+    |       "prices": [              |
+    |         {                      |
+    |           "side": "home",      |
+    |           "odds_eu": 1.91,     |
+    |           "imp_prob": 0.524    |
+    |         },                     |
+    |         {                      |
+    |           "side": "away",      |
+    |           "odds_eu": 2.10,     |
+    |           "imp_prob": 0.476    |
+    |         }                      |
+    |       ]                        |
+    |     }]                         |
+    |   }                            |
+    |                                |
+    |<--ack--------------------------|
+```
+
+**Submission fields:**
+- `odds_eu`: Decimal odds (e.g., 1.91 = -110 American, 2.00 = even money)
+- `imp_prob`: Implied probability (0 to 1, before vig normalization)
+- `side`: The outcome being priced (home/away for moneyline/spread, over/under for totals)
+
+The validator:
+1. Validates the submission (rate limits, schema, timing)
+2. Records it with a timestamp
+3. Later scores it against ground truth (closing lines, outcomes)
+
+### 4. Outcome Submission (Miner → Validator)
+
+After an event settles, miners can submit the observed outcome:
+
+```
+Miner                              Validator
+    |                                |
+    |---OUTCOME_PUSH---------------->|
+    |   {                            |
+    |     "event_id": 456,           |
+    |     "result": "home",          |
+    |     "score_home": 3,           |
+    |     "score_away": 2,           |
+    |   }                            |
+    |                                |
+    |<--ack--------------------------|
+```
+
+### Time Windows
+
+| Window | Duration | Description |
+|--------|----------|-------------|
+| Game visibility | 14 days ahead | Games appear in GAME_DATA_REQUEST |
+| Odds acceptance | 7 days before start | `accepts_odds: true` in response |
+| Scoring window | Until game start | Earlier = better for lead-lag scoring |
+
+### Flow Summary
+
+```
+1. Miner starts, registers axon on chain
+2. Validator discovers miner, pushes connection info
+3. Miner requests game data (games + markets, NO odds)
+4. Miner generates probabilities from its own data/models
+5. Miner submits odds on cadence
+6. After settlement, miner submits outcomes
+7. Validator scores submissions → SkillScore → emissions
+```
+
 ## Before you begin
 You do not need to be a developer, but you should be able to run basic
 commands in a terminal and edit a text file.

@@ -154,12 +154,21 @@ class MainScoreHandler:
         return results
 
 
-async def run_main_scoring_if_due_async(*, step: int, app_config: Any, handlers: Any) -> None:
+async def run_main_scoring_if_due_async(
+    *,
+    step: int,
+    app_config: Any,
+    handlers: Any,
+    validator: Any = None,
+    emit_weights: bool = True,
+) -> None:
     """
     Step-based scheduler for main scoring. If due, runs the main scoring handler.
     - step: current validator step counter
     - app_config: validator application config (expects .core.timers.main_score_steps)
     - handlers: Handlers instance with .main_score_handler
+    - validator: Validator instance (required for weight emission)
+    - emit_weights: If True, emit weights after scoring
     """
     try:
         steps_interval = 25
@@ -169,7 +178,10 @@ async def run_main_scoring_if_due_async(*, step: int, app_config: Any, handlers:
             pass
         if steps_interval > 0 and (step % steps_interval == 0):
             try:
-                await handlers.main_score_handler.run()
+                await handlers.main_score_handler.run(
+                    emit_weights=emit_weights,
+                    validator=validator,
+                )
             except Exception as e:
                 bt.logging.warning({"main_score_error": str(e)})
     except Exception:

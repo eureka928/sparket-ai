@@ -144,6 +144,87 @@ class SetWeightsHandler:
         # Emit to chain
         self._emit_weights(validator, scores)
 
+    def _get_burn_uid(self, validator: Any) -> Optional[int]:
+        """Get the UID for the burn hotkey (subnet owner).
+
+        Args:
+            validator: Validator instance
+
+        Returns:
+            UID of the burn hotkey if found, None otherwise
+        """
+        try:
+            burn_hotkey = validator.subtensor.get_subnet_owner_hotkey(
+                netuid=validator.config.netuid
+            )
+            if burn_hotkey is None:
+                bt.logging.warning("Could not retrieve subnet owner hotkey")
+                return None
+
+            hotkeys = list(validator.metagraph.hotkeys)
+            if burn_hotkey not in hotkeys:
+                bt.logging.warning({
+                    "burn_hotkey_not_registered": {
+                        "burn_hotkey": burn_hotkey,
+                        "message": "Subnet owner hotkey not registered as a miner; skipping burn allocation",
+                    }
+                })
+                return None
+
+            burn_uid = hotkeys.index(burn_hotkey)
+            bt.logging.debug({
+                "burn_hotkey_found": {
+                    "burn_hotkey": burn_hotkey,
+                    "burn_uid": burn_uid,
+                }
+            })
+            return burn_uid
+
+        except Exception as e:
+            bt.logging.warning({"get_burn_uid_error": str(e)})
+            return None
+
+    def _apply_burn_rate(
+        self,
+        raw_weights: np.ndarray,
+        burn_uid: int,
+        burn_rate: float,
+    ) -> np.ndarray:
+        """Apply burn rate redistribution to weights.
+
+        Allocates burn_rate fraction to the burn_uid and scales down
+        all other weights proportionally to maintain sum = 1.0.
+
+        Args:
+            raw_weights: Normalized weights (sum = 1.0)
+            burn_uid: UID for the burn hotkey
+            burn_rate: Fraction to allocate to burn hotkey (0.0 to 1.0)
+
+        Returns:
+            Adjusted weights with burn allocation applied
+        """
+        if burn_rate <= 0.0:
+            return raw_weights
+
+        adjusted_weights = raw_weights.copy()
+
+        # Scale down all miner weights by (1 - burn_rate)
+        adjusted_weights *= (1.0 - burn_rate)
+
+        # Assign burn_rate to the burn_uid
+        adjusted_weights[burn_uid] = burn_rate
+
+        bt.logging.info({
+            "burn_rate_applied": {
+                "burn_rate": burn_rate,
+                "burn_uid": burn_uid,
+                "burn_weight": float(adjusted_weights[burn_uid]),
+                "miner_weight_sum": float(np.sum(adjusted_weights) - adjusted_weights[burn_uid]),
+            }
+        })
+
+        return adjusted_weights
+
     def _emit_weights(self, validator: Any, scores: np.ndarray) -> None:
         """Emit weights to chain.
 
@@ -160,11 +241,43 @@ class SetWeightsHandler:
 
         # Calculate norm and normalize
         norm = np.linalg.norm(scores, ord=1, axis=0, keepdims=True)
-        if np.any(norm == 0) or np.isnan(norm).any():
-            bt.logging.warning("All scores are zero or invalid; skipping weight emission")
-            return
+        all_scores_zero = np.any(norm == 0) or np.isnan(norm).any()
 
-        raw_weights = scores / norm
+        if all_scores_zero:
+            # No valid miner scores - allocate 100% to burn hotkey
+            burn_uid = self._get_burn_uid(validator)
+            if burn_uid is None:
+                bt.logging.warning(
+                    "All scores are zero and burn hotkey not found; skipping weight emission"
+                )
+                return
+
+            # Create weights array with 100% to burn hotkey
+            raw_weights = np.zeros(len(scores), dtype=np.float32)
+            raw_weights[burn_uid] = 1.0
+
+            bt.logging.info({
+                "burn_100_percent": {
+                    "reason": "No valid miner scores",
+                    "burn_uid": burn_uid,
+                }
+            })
+        else:
+            raw_weights = scores / norm
+
+            # Apply burn rate if configured
+            burn_rate = float(self.params.weight_emission.burn_rate)
+            if burn_rate > 0.0:
+                burn_uid = self._get_burn_uid(validator)
+                if burn_uid is not None:
+                    raw_weights = self._apply_burn_rate(raw_weights, burn_uid, burn_rate)
+                else:
+                    bt.logging.warning({
+                        "burn_rate_skipped": {
+                            "burn_rate": burn_rate,
+                            "reason": "Could not find burn hotkey UID",
+                        }
+                    })
 
         bt.logging.debug({"raw_weights": raw_weights.tolist()[:10]})  # First 10
         bt.logging.debug({"raw_weight_uids": validator.metagraph.uids.tolist()[:10]})
@@ -177,15 +290,15 @@ class SetWeightsHandler:
             metagraph=validator.metagraph,
         )
 
-        bt.logging.debug({"processed_weights_sample": processed_weights[:10].tolist()})
-        bt.logging.debug({"processed_weight_uids_sample": processed_weight_uids[:10].tolist()})
+        bt.logging.debug({"processed_weights_sample": list(processed_weights[:10])})
+        bt.logging.debug({"processed_weight_uids_sample": list(processed_weight_uids[:10])})
 
         uint_uids, uint_weights = convert_weights_and_uids_for_emit(
             uids=processed_weight_uids, weights=processed_weights
         )
 
-        bt.logging.debug({"uint_weights_sample": uint_weights[:10]})
-        bt.logging.debug({"uint_uids_sample": uint_uids[:10]})
+        bt.logging.debug({"uint_weights_sample": list(uint_weights[:10])})
+        bt.logging.debug({"uint_uids_sample": list(uint_uids[:10])})
 
         # Set the weights on chain
         try:

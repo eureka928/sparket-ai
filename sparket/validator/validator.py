@@ -320,43 +320,8 @@ class BaseValidatorNeuron(BaseNeuron):
             bt.logging.debug({"validator_init": {"traceback": traceback.format_exc()}})
             raise
     def serve_axon(self):
-        """Create and serve the validator axon, routing incoming synapses to listeners.
-        
-        SECURITY: If proxy_url is configured, we skip registering to chain to avoid
-        exposing the validator's real IP. Miners receive connection info via 
-        CONNECTION_INFO_PUSH broadcasts which will use the proxy URL.
-        """
+        """Create and serve the validator axon, routing incoming synapses to listeners."""
         try:
-            # Check if proxy mode is enabled - if so, we won't register IP to chain
-            proxy_mode = False
-            proxy_url = None
-            try:
-                # Access from app_config which is already loaded
-                app_cfg = getattr(self, "app_config", None)
-                if app_cfg:
-                    core = getattr(app_cfg, "core", None)
-                    api_cfg = getattr(core, "api", None) if core else None
-                    proxy_url = getattr(api_cfg, "proxy_url", None) if api_cfg else None
-                
-                # Fallback: try loading settings directly
-                if not proxy_url:
-                    from sparket.config import load_settings
-                    settings = load_settings(role="validator")
-                    proxy_url = getattr(settings.api, "proxy_url", None) if hasattr(settings, "api") else None
-                
-                if proxy_url:
-                    proxy_mode = True
-                    bt.logging.info({
-                        "axon_proxy_mode": {
-                            "enabled": True,
-                            "proxy_url": proxy_url,
-                            "chain_registration": "skipped",
-                            "reason": "IP privacy - miners receive proxy URL via broadcast",
-                        }
-                    })
-            except Exception as e:
-                bt.logging.warning({"axon_proxy_mode_check_error": str(e)})
-            
             # Initialize axon and attach forward to route incoming synapses
             cfg = self.config() if callable(self.config) else self.config
             self.axon = bt.Axon(
@@ -420,49 +385,40 @@ class BaseValidatorNeuron(BaseNeuron):
                     return False
                 lower = addr.lower()
                 return "127.0.0.1" in lower or "localhost" in lower
-            
-            # SECURITY: Skip chain registration if proxy mode is enabled
-            # This prevents exposing the validator's real IP to the chain
-            if proxy_mode:
-                bt.logging.info({
-                    "axon_chain_registration": "skipped_proxy_mode",
-                    "reason": "proxy_url is configured - IP will not be posted to chain",
-                })
-            else:
-                try:
-                    self.axon.serve(netuid=self.config.netuid, subtensor=self.subtensor)
-                    registered = True
-                except Exception as serve_err:
-                    config_subtensor = getattr(self.config, "subtensor", None)
-                    desired_endpoint = getattr(config_subtensor, "chain_endpoint", None) if config_subtensor else None
-                    host = None
-                    if desired_endpoint and isinstance(desired_endpoint, str):
-                        try:
-                            from urllib.parse import urlparse
-                            parsed = urlparse(desired_endpoint if "://" in desired_endpoint else f"tcp://{desired_endpoint}")
-                            host = parsed.hostname
-                        except Exception:
-                            host = None
-                    config_axon = getattr(self.config, "axon", None)
-                    axon_host = getattr(config_axon, "ip", None) if config_axon else None
-                    is_local_intent = any([
-                        _is_loopback(host),
-                        _is_loopback(axon_host),
-                        isinstance(getattr(config_subtensor, "network", None), str)
-                        and getattr(config_subtensor, "network", "").lower() == "local",
-                    ])
-                    message = str(serve_err)
-                    if is_local_intent and "InvalidIpAddress" in message:
-                        bt.logging.warning({
-                            "axon_registration_skipped": {
-                                "reason": "InvalidIpAddress",
-                                "endpoint": desired_endpoint,
-                                "axon_ip": axon_host,
-                                "detail": message,
-                            }
-                        })
-                    else:
-                        raise
+            try:
+                self.axon.serve(netuid=self.config.netuid, subtensor=self.subtensor)
+                registered = True
+            except Exception as serve_err:
+                config_subtensor = getattr(self.config, "subtensor", None)
+                desired_endpoint = getattr(config_subtensor, "chain_endpoint", None) if config_subtensor else None
+                host = None
+                if desired_endpoint and isinstance(desired_endpoint, str):
+                    try:
+                        from urllib.parse import urlparse
+                        parsed = urlparse(desired_endpoint if "://" in desired_endpoint else f"tcp://{desired_endpoint}")
+                        host = parsed.hostname
+                    except Exception:
+                        host = None
+                config_axon = getattr(self.config, "axon", None)
+                axon_host = getattr(config_axon, "ip", None) if config_axon else None
+                is_local_intent = any([
+                    _is_loopback(host),
+                    _is_loopback(axon_host),
+                    isinstance(getattr(config_subtensor, "network", None), str)
+                    and getattr(config_subtensor, "network", "").lower() == "local",
+                ])
+                message = str(serve_err)
+                if is_local_intent and "InvalidIpAddress" in message:
+                    bt.logging.warning({
+                        "axon_registration_skipped": {
+                            "reason": "InvalidIpAddress",
+                            "endpoint": desired_endpoint,
+                            "axon_ip": axon_host,
+                            "detail": message,
+                        }
+                    })
+                else:
+                    raise
             try:
                 axon_info = {
                     "wallet_hotkey": getattr(getattr(self.wallet, "hotkey", None), "ss58_address", None),
@@ -583,6 +539,8 @@ class BaseValidatorNeuron(BaseNeuron):
                                             step=self.step,
                                             app_config=self.app_config,
                                             handlers=self.handlers,
+                                            validator=self,
+                                            emit_weights=False,  # Base neuron handles weight cadence
                                         ),
                                         timeout=timeouts["scoring"],
                                     )
@@ -615,6 +573,8 @@ class BaseValidatorNeuron(BaseNeuron):
                                         step=self.step,
                                         app_config=self.app_config,
                                         handlers=self.handlers,
+                                        validator=self,
+                                        emit_weights=False,  # Base neuron handles weight cadence
                                     ),
                                     timeout=timeouts["scoring"],
                                 )
@@ -705,95 +665,18 @@ class BaseValidatorNeuron(BaseNeuron):
             exit()
 
     def set_weights(self):
-        """Set weights on chain based on miner skill scores from database."""
-        if not hasattr(self, "handlers") or not hasattr(self.handlers, "set_weights_handler"):
-            bt.logging.warning({"set_weights": "handlers not initialized, skipping"})
-            return
-        
+        """Set weights on chain using scores from database."""
         try:
-            # Load scores from database and emit to chain
-            import asyncio
-            
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # Already in async context - create task
-                asyncio.create_task(
-                    self.handlers.set_weights_handler.set_weights_from_db(self)
-                )
-            else:
-                # Run synchronously
-                loop.run_until_complete(
-                    self.handlers.set_weights_handler.set_weights_from_db(self)
-                )
-        except Exception as e:
-            bt.logging.error({"set_weights_error": str(e)})
+            if not hasattr(self, 'handlers') or not hasattr(self.handlers, 'set_weights_handler'):
+                bt.logging.debug({"validator_set_weights": "skipped", "reason": "handler_not_ready"})
+                return
 
-    def resync_metagraph(self) -> bool:
-        """Override to sync metagraph AND update miner table in database.
-        
-        This is critical for handling deregistrations:
-        - Old miners are marked inactive (preserving historical data)
-        - New miners are registered (can submit immediately)
-        - Hotkey changes at UIDs are logged for audit
-        """
-        import asyncio
-        import copy
-        
-        # Save old hotkeys for change detection
-        old_hotkeys = copy.deepcopy(self.hotkeys) if hasattr(self, "hotkeys") else []
-        
-        # Call parent metagraph sync
-        try:
-            self.metagraph.sync(subtensor=self.subtensor)
+            # Run async weight emission in the event loop
+            self.loop.run_until_complete(
+                self.handlers.set_weights_handler.set_weights_from_db(self)
+            )
         except Exception as e:
-            bt.logging.warning({"metagraph_resync_error": str(e)})
-            return False
-        
-        # Update hotkey cache
-        self.hotkeys = copy.deepcopy(self.metagraph.hotkeys)
-        
-        # Sync miners to database (handles deregistrations)
-        if hasattr(self, "handlers") and hasattr(self.handlers, "sync_metagraph_handler"):
-            try:
-                # Run async miner sync in sync context
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # Already in async context, create task
-                    asyncio.create_task(
-                        self.handlers.sync_metagraph_handler.miner_mgmt.sync_metagraph_to_db(
-                            metagraph=self.metagraph,
-                            block=int(self.block),
-                            netuid=self.config.netuid,
-                        )
-                    )
-                else:
-                    # Sync context, run blocking
-                    result = loop.run_until_complete(
-                        self.handlers.sync_metagraph_handler.miner_mgmt.sync_metagraph_to_db(
-                            metagraph=self.metagraph,
-                            block=int(self.block),
-                            netuid=self.config.netuid,
-                        )
-                    )
-                    if result.get("error"):
-                        bt.logging.warning({"miner_db_sync_error": result["error"]})
-                    else:
-                        bt.logging.info({
-                            "miner_db_sync": {
-                                "inserted": result.get("inserted", 0),
-                                "updated": result.get("updated", 0),
-                                "deregistered": result.get("deregistered", 0),
-                            }
-                        })
-                        # Log deregistration events
-                        for change in result.get("hotkey_changes", []):
-                            bt.logging.warning({
-                                "miner_deregistered": change
-                            })
-            except Exception as e:
-                bt.logging.warning({"miner_db_sync_fatal": str(e)})
-        
-        return True
+            bt.logging.warning({"validator_set_weights_error": str(e)})
 
 
 

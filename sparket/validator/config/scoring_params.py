@@ -519,6 +519,26 @@ class RetentionParams(BaseModel):
     scoring_work_queue_days: int = Field(default=7, ge=1, le=365)
 
 
+class WeightEmissionParams(BaseModel):
+    """Parameters for weight emission and burn allocation.
+
+    Controls how miner rewards are distributed between actual miners
+    and the subnet owner (burn hotkey).
+    """
+
+    burn_rate: Decimal = Field(
+        default=Decimal("0.9"),
+        ge=Decimal("0"),
+        le=Decimal("1"),
+        description=(
+            "Fraction of total weight allocated to the subnet owner (burn hotkey). "
+            "A burn_rate of 0.9 means 90% of emissions go to the burn hotkey, "
+            "and the remaining 10% is distributed proportionally among miners. "
+            "Set to 0 to disable burn allocation."
+        ),
+    )
+
+
 class ScoringParams(BaseModel):
     """Master configuration for all scoring parameters."""
 
@@ -537,6 +557,7 @@ class ScoringParams(BaseModel):
     time_weight: TimeWeightParams = Field(default_factory=TimeWeightParams)
     ingest: IngestParams = Field(default_factory=IngestParams)
     retention: RetentionParams = Field(default_factory=RetentionParams)
+    weight_emission: WeightEmissionParams = Field(default_factory=WeightEmissionParams)
 
 
 # Default instance for easy import
@@ -564,6 +585,7 @@ __all__ = [
     "SecurityBounds",
     "IngestParams",
     "RetentionParams",
+    "WeightEmissionParams",
     "ScoringParams",
     "DEFAULT_SCORING_PARAMS",
     "get_scoring_params",

@@ -188,7 +188,7 @@ def run_migrations_online() -> None:
 
         import asyncio
 
-        asyncio.get_event_loop().run_until_complete(do_run_migrations())
+        asyncio.run(do_run_migrations())
         connectable.sync_engine.dispose()
         bt.logging.info({"alembic": {"mode": "online", "phase": "async_disposed"}})
     else:
