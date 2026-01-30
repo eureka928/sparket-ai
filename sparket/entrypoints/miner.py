@@ -1,7 +1,34 @@
+# Clear bytecode cache FIRST, before any sparket imports load cached .pyc files
+# This prevents stale code from running after updates
+import shutil
+import sys
+from pathlib import Path
+
+def _clear_bytecode_cache() -> int:
+    """Clear __pycache__ dirs and .pyc files from sparket package."""
+    base = Path(__file__).parent.parent
+    removed = 0
+    for cache_dir in base.rglob("__pycache__"):
+        try:
+            shutil.rmtree(cache_dir)
+            removed += 1
+        except (OSError, PermissionError):
+            pass
+    for pyc_file in base.rglob("*.pyc"):
+        try:
+            pyc_file.unlink()
+        except (OSError, PermissionError):
+            pass
+    return removed
+
+_CLEARED_CACHES = _clear_bytecode_cache()
+if _CLEARED_CACHES > 0:
+    print(f"[miner] Cleared {_CLEARED_CACHES} bytecode cache directories", file=sys.stderr, flush=True)
+
+# Now safe to import the rest
 import argparse
 import asyncio
 import os
-import shutil
 import signal
 import threading
 
