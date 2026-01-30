@@ -89,6 +89,9 @@ def check_config(cls, config: "bt.Config"):
         if env_axon_host and getattr(config, "axon", None):
             config.axon.ip = env_axon_host
             config.axon.external_ip = env_axon_host
+        env_netuid = os.getenv("SPARKET_NETUID")
+        if env_netuid:
+            config.netuid = int(env_netuid)
     except Exception:
         pass
 

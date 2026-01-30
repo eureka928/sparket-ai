@@ -1,0 +1,892 @@
+"""CustomMiner - Main orchestration for the custom miner.
+
+This miner is optimized for the scoring system:
+- 50% EconDim: Beat closing lines (CLV > 0)
+- 30% InfoDim: Originality + lead market
+- 20% Outcome accuracy (ForecastDim + SkillDim)
+
+Key strategies:
+1. Enhanced Elo model for probability estimation
+2. Isotonic calibration for accuracy
+3. Strategic timing for maximum time credit
+4. (Future) Originality tracking for InfoDim
+"""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import bittensor as bt
+
+from sparket.miner.base.engines.interface import OddsPrices
+from sparket.miner.base.fetchers.espn import ESPNFetcher
+from sparket.miner.custom.config import CustomMinerConfig
+from sparket.miner.custom.data.fetchers.odds_api import OddsAPIFetcher, blend_with_market
+from sparket.miner.custom.data.storage.line_history import LineHistory
+from sparket.miner.custom.models.calibration.isotonic import IsotonicCalibrator
+from sparket.miner.custom.models.engines.elo import EloEngine
+from sparket.miner.custom.models.engines.ensemble import EnsembleEngine
+from sparket.miner.custom.models.engines.poisson import PoissonEngine
+from sparket.miner.custom.strategy.originality import OriginalityTracker
+from sparket.miner.custom.strategy.timing import (
+    SubmissionDecision,
+    TimingStrategy,
+)
+from sparket.miner.utils.ratelimit import TokenBucket
+
+
+class CustomMiner:
+    """Custom miner implementation optimized for scoring.
+
+    Features:
+    - Elo-based probability model with sport-specific tuning
+    - Isotonic calibration for probability accuracy
+    - Strategic submission timing for maximum time credit
+    - Rate limiting to respect validator limits
+
+    Usage:
+        config = CustomMinerConfig.from_env()
+        miner = CustomMiner(
+            hotkey="5xxx...",
+            config=config,
+            validator_client=client,
+            game_sync=sync,
+        )
+        await miner.start()
+    """
+
+    def __init__(
+        self,
+        hotkey: str,
+        config: CustomMinerConfig,
+        validator_client: Any,
+        game_sync: Any,
+        data_dir: Optional[str] = None,
+    ) -> None:
+        """Initialize the custom miner.
+
+        Args:
+            hotkey: Miner's hotkey (ss58 address)
+            config: Configuration
+            validator_client: Client for submitting to validators
+            game_sync: GameDataSync for fetching markets
+            data_dir: Directory for persistent data (ratings, calibration)
+        """
+        self.hotkey = hotkey
+        self.config = config
+        self.validator_client = validator_client
+        self.game_sync = game_sync
+
+        # Set up data directory
+        if data_dir:
+            self._data_dir = Path(data_dir)
+        else:
+            self._data_dir = Path.home() / ".sparket" / "custom_miner"
+        self._data_dir.mkdir(parents=True, exist_ok=True)
+
+        # Initialize components
+        self._elo = EloEngine(
+            config=config.elo,
+            vig=config.vig,
+            ratings_path=str(self._data_dir / "elo_ratings.json"),
+        )
+
+        self._calibrator = IsotonicCalibrator(
+            min_samples=config.calibration.min_samples,
+            data_path=(
+                str(self._data_dir / "calibration.json")
+                if config.calibration.enabled
+                else None
+            ),
+        )
+
+        # Poisson engine for TOTAL markets
+        self._poisson = PoissonEngine(
+            data_path=str(self._data_dir / "poisson_profiles.json"),
+        )
+
+        # Line history for tracking market movements
+        self._line_history = LineHistory(
+            data_path=str(self._data_dir / "line_history.json"),
+            max_history_hours=168.0,  # 7 days
+        )
+
+        # Originality tracking for InfoDim optimization
+        self._originality = OriginalityTracker(
+            data_path=str(self._data_dir / "originality.json"),
+            max_history_days=30.0,
+        )
+
+        # Ensemble engine combining all models
+        self._ensemble = EnsembleEngine(
+            elo_engine=self._elo,
+            poisson_engine=self._poisson,
+            base_weights=config.engine_weights,
+            confidence_scaling=True,
+        )
+
+        self._timing = TimingStrategy(config=config.timing)
+        self._espn = ESPNFetcher()
+
+        # The-Odds-API for market consensus (optional but recommended)
+        self._odds_api: Optional[OddsAPIFetcher] = None
+        if config.odds_api_key:
+            self._odds_api = OddsAPIFetcher(
+                api_key=config.odds_api_key,
+                cache_ttl_seconds=300,  # 5 min cache
+            )
+            bt.logging.info({"custom_miner": "odds_api_enabled"})
+
+        # Rate limiting
+        self._global_bucket = TokenBucket(config.rate_limit_per_minute)
+        self._per_market_buckets: Dict[int, TokenBucket] = {}
+
+        # State
+        self._running = False
+        self._tasks: List[asyncio.Task] = []
+        self._submissions_count = 0
+        self._errors_count = 0
+        # Track submitted predictions for calibration training
+        # Key: event_id, Value: submitted home probability
+        self._submitted_predictions: Dict[str, float] = {}
+
+    @property
+    def is_running(self) -> bool:
+        """Whether the miner is currently running."""
+        return self._running
+
+    @property
+    def submissions_count(self) -> int:
+        """Number of submissions made."""
+        return self._submissions_count
+
+    @property
+    def errors_count(self) -> int:
+        """Number of errors encountered."""
+        return self._errors_count
+
+    async def start(self) -> None:
+        """Start the custom miner background loops."""
+        if self._running:
+            return
+
+        self._running = True
+        bt.logging.info({"custom_miner": "starting"})
+
+        # Start background tasks
+        self._tasks = [
+            asyncio.create_task(self._odds_loop()),
+            asyncio.create_task(self._outcome_loop()),
+        ]
+
+        bt.logging.info({
+            "custom_miner": "started",
+            "calibration_samples": self._calibrator.sample_count,
+            "elo_ratings_path": str(self._data_dir / "elo_ratings.json"),
+        })
+
+    async def stop(self) -> None:
+        """Stop the custom miner."""
+        self._running = False
+
+        for task in self._tasks:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        self._tasks.clear()
+
+        # Cleanup
+        await self._espn.close()
+        if self._odds_api:
+            await self._odds_api.close()
+
+        bt.logging.info({
+            "custom_miner": "stopped",
+            "submissions": self._submissions_count,
+            "errors": self._errors_count,
+        })
+
+    def start_background(self) -> None:
+        """Start in background (non-blocking)."""
+        asyncio.create_task(self.start())
+
+    # -------------------------------------------------------------------------
+    # Odds Generation Pipeline
+    # -------------------------------------------------------------------------
+
+    async def generate_odds(self, market: Dict[str, Any]) -> Optional[OddsPrices]:
+        """Generate calibrated odds for a market using ensemble model.
+
+        Pipeline:
+        1. Fetch market consensus from The-Odds-API (if available)
+        2. Use ensemble engine to combine Elo + Market + Poisson
+        3. Apply isotonic calibration
+        4. Convert to odds with vig
+
+        Args:
+            market: Market info dict
+
+        Returns:
+            OddsPrices or None if unable to generate
+        """
+        home_team = market.get("home_team", "")
+        away_team = market.get("away_team", "")
+        sport = market.get("sport", "NFL")
+        kind = market.get("kind", "MONEYLINE").upper()
+
+        if not home_team or not away_team:
+            return None
+
+        # 1. Get market consensus from The-Odds-API
+        market_odds = None
+        if self._odds_api:
+            try:
+                market_odds = await self._odds_api.get_consensus_odds(
+                    sport, home_team, away_team
+                )
+                if market_odds:
+                    # Record market odds in line history for movement tracking
+                    market_id = market.get("market_id")
+                    if market_id:
+                        self._line_history.record(
+                            market_id=int(market_id),
+                            home_prob=market_odds.home_prob,
+                            away_prob=1.0 - market_odds.home_prob,
+                            source="market",
+                        )
+            except Exception as e:
+                bt.logging.debug({
+                    "custom_miner": "market_odds_error",
+                    "error": str(e),
+                })
+
+        # 2. Use ensemble engine to combine all models
+        ensemble_pred = self._ensemble.predict(
+            market=market,
+            market_odds=market_odds,
+        )
+
+        if ensemble_pred is None:
+            return None
+
+        cal_home = ensemble_pred.home_prob
+        cal_away = ensemble_pred.away_prob
+
+        # 3. Apply calibration if enabled and fitted
+        if self.config.calibration.enabled and self._calibrator.is_fitted:
+            cal_home, cal_away = self._calibrator.calibrate_pair(cal_home, cal_away)
+
+        # 4. Convert to odds with vig
+        home_odds = self._probability_to_odds(cal_home)
+        away_odds = self._probability_to_odds(cal_away)
+
+        # 5. Handle TOTAL market over/under
+        over_prob = ensemble_pred.over_prob
+        under_prob = ensemble_pred.under_prob
+        over_odds = None
+        under_odds = None
+
+        if over_prob is not None and under_prob is not None:
+            over_odds = self._probability_to_odds(over_prob)
+            under_odds = self._probability_to_odds(under_prob)
+
+        calibrated_odds = OddsPrices(
+            home_prob=cal_home,
+            away_prob=cal_away,
+            home_odds_eu=home_odds,
+            away_odds_eu=away_odds,
+            over_prob=over_prob,
+            under_prob=under_prob,
+            over_odds_eu=over_odds,
+            under_odds_eu=under_odds,
+        )
+
+        bt.logging.debug({
+            "custom_miner": "ensemble_odds_generated",
+            "market_id": market.get("market_id"),
+            "kind": kind,
+            "final_home_prob": round(cal_home, 3),
+            "home_odds": home_odds,
+            "ensemble_confidence": round(ensemble_pred.confidence, 3),
+            "dominant_source": ensemble_pred.dominant_source,
+            "models_agreed": ensemble_pred.models_agreed,
+            "calibration_applied": self._calibrator.is_fitted,
+        })
+
+        return calibrated_odds
+
+    def _probability_to_odds(self, prob: float) -> float:
+        """Convert probability to EU decimal odds with vig.
+
+        Validator bounds: odds_eu in (1.01, 1000], imp_prob in (0.001, 0.999)
+        """
+        implied_prob = prob + (self.config.vig / 2)
+        # Clamp to validator-accepted range (0.001, 0.999)
+        implied_prob = max(0.001, min(0.999, implied_prob))
+        odds = 1.0 / implied_prob
+        # Clamp odds to validator-accepted range (1.01, 1000]
+        odds = max(1.01, min(1000.0, odds))
+        return round(odds, 2)
+
+    # -------------------------------------------------------------------------
+    # Odds Loop
+    # -------------------------------------------------------------------------
+
+    async def _odds_loop(self) -> None:
+        """Background loop for odds submission."""
+        while self._running:
+            try:
+                await self._run_odds_cycle()
+            except Exception as e:
+                self._errors_count += 1
+                bt.logging.warning({"custom_miner": "odds_cycle_error", "error": str(e)})
+
+            # Sleep until next refresh
+            await asyncio.sleep(self.config.timing.refresh_interval_seconds)
+
+    async def _run_odds_cycle(self) -> None:
+        """Run one odds submission cycle with timing strategy."""
+        # Cleanup stale rate limit buckets to prevent memory buildup
+        self._cleanup_stale_buckets()
+
+        # Cleanup old line history (markets that finished)
+        self._line_history.cleanup_old_markets()
+
+        # Get active markets
+        markets = await self.game_sync.get_active_markets()
+
+        if not markets:
+            bt.logging.debug({"custom_miner": "no_active_markets"})
+            return
+
+        # Enrich markets with event data for timing
+        enriched_markets = await self._enrich_markets(markets)
+
+        # Get prioritized submission schedule
+        schedule = self._timing.get_submission_schedule(enriched_markets)
+
+        if not schedule:
+            bt.logging.debug({"custom_miner": "no_markets_due_for_submission"})
+            return
+
+        submitted = 0
+        skipped = 0
+        deferred = 0
+
+        for market, decision in schedule:
+            market_id = market.get("market_id", 0)
+
+            # Check rate limits
+            if not self._check_rate_limit(market_id):
+                skipped += 1
+                continue
+
+            try:
+                odds = await self.generate_odds(market)
+                if odds is None:
+                    continue
+
+                # Check line movement for optimal timing
+                start_time = market.get("start_time_utc")
+                if start_time:
+                    now = datetime.now(timezone.utc)
+                    if isinstance(start_time, str):
+                        start_time = datetime.fromisoformat(
+                            start_time.replace("Z", "+00:00")
+                        )
+                    hours_to_game = (start_time - now).total_seconds() / 3600
+
+                    should_submit, reason = self._line_history.should_submit_now(
+                        market_id=market_id,
+                        our_home_prob=odds.home_prob,
+                        hours_to_game=hours_to_game,
+                    )
+
+                    if not should_submit:
+                        deferred += 1
+                        bt.logging.debug({
+                            "custom_miner": "submission_deferred",
+                            "market_id": market_id,
+                            "reason": reason,
+                            "hours_to_game": round(hours_to_game, 1),
+                        })
+                        continue
+
+                payload = self._build_odds_payload(market, odds)
+                success = await self.validator_client.submit_odds(payload)
+
+                if success:
+                    submitted += 1
+                    self._submissions_count += 1
+                    self._timing.record_submission(market_id)
+
+                    # Record our prediction in line history
+                    self._line_history.record(
+                        market_id=market_id,
+                        home_prob=odds.home_prob,
+                        away_prob=odds.away_prob,
+                        source="prediction",
+                    )
+
+                    # Record for originality tracking (InfoDim)
+                    market_consensus = self._line_history.get_consensus_prob(market_id)
+                    if market_consensus:
+                        market_home_prob, _ = market_consensus
+                        self._originality.record_submission(
+                            market_id=market_id,
+                            our_prob=odds.home_prob,
+                            market_prob=market_home_prob,
+                        )
+
+                    # Store submitted probability for calibration training
+                    event_id = market.get("event_id")
+                    if event_id and odds.home_prob is not None:
+                        self._submitted_predictions[str(event_id)] = odds.home_prob
+
+            except Exception as e:
+                bt.logging.debug({
+                    "custom_miner": "market_submission_failed",
+                    "market_id": market.get("market_id"),
+                    "error": str(e),
+                })
+
+        if submitted > 0 or skipped > 0 or deferred > 0:
+            bt.logging.info({
+                "custom_miner": "odds_cycle_complete",
+                "submitted": submitted,
+                "skipped_rate_limit": skipped,
+                "deferred_line_movement": deferred,
+                "total_markets": len(schedule),
+            })
+
+    async def _enrich_markets(
+        self,
+        markets: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Enrich market data with event info for timing strategy."""
+        # Markets from game_sync should already have event data
+        # Just ensure datetime fields are properly parsed
+        enriched = []
+        for market in markets:
+            m = dict(market)
+
+            # Ensure start_time_utc is a datetime
+            start_time = m.get("start_time_utc")
+            if isinstance(start_time, str):
+                m["start_time_utc"] = datetime.fromisoformat(
+                    start_time.replace("Z", "+00:00")
+                )
+
+            enriched.append(m)
+
+        return enriched
+
+    def _check_rate_limit(self, market_id: int) -> bool:
+        """Check rate limits for a market."""
+        # Global rate limit
+        if not self._global_bucket.allow():
+            return False
+
+        # Per-market rate limit
+        bucket = self._per_market_buckets.setdefault(
+            market_id,
+            TokenBucket(self.config.per_market_limit_per_minute),
+        )
+        return bucket.allow()
+
+    def _cleanup_stale_buckets(self, max_age_seconds: float = 3600.0) -> int:
+        """Remove rate limit buckets that haven't been used recently.
+
+        This prevents memory buildup for long-running miners with many markets.
+
+        Args:
+            max_age_seconds: Remove buckets not used in this many seconds (default: 1 hour)
+
+        Returns:
+            Number of buckets removed
+        """
+        import time
+        now = time.time()
+        stale_ids = [
+            market_id
+            for market_id, bucket in self._per_market_buckets.items()
+            if (now - bucket.last_refill) > max_age_seconds
+        ]
+
+        for market_id in stale_ids:
+            del self._per_market_buckets[market_id]
+
+        if stale_ids:
+            bt.logging.debug({
+                "custom_miner": "rate_limit_cleanup",
+                "removed": len(stale_ids),
+                "remaining": len(self._per_market_buckets),
+            })
+
+        return len(stale_ids)
+
+    def _build_odds_payload(
+        self,
+        market: Dict[str, Any],
+        odds: OddsPrices,
+    ) -> Dict[str, Any]:
+        """Build odds submission payload."""
+        now = datetime.now(timezone.utc)
+        kind = market.get("kind", "MONEYLINE").upper()
+
+        prices = []
+        if kind in ("MONEYLINE", "SPREAD"):
+            prices = [
+                {"side": "home", "odds_eu": odds.home_odds_eu, "imp_prob": odds.home_prob},
+                {"side": "away", "odds_eu": odds.away_odds_eu, "imp_prob": odds.away_prob},
+            ]
+        elif kind == "TOTAL":
+            prices = [
+                {"side": "over", "odds_eu": odds.over_odds_eu or odds.home_odds_eu, "imp_prob": odds.over_prob or odds.home_prob},
+                {"side": "under", "odds_eu": odds.under_odds_eu or odds.away_odds_eu, "imp_prob": odds.under_prob or odds.away_prob},
+            ]
+
+        return {
+            "miner_hotkey": self.hotkey,
+            "submissions": [{
+                "market_id": int(market.get("market_id", 0)),
+                "kind": kind.lower(),
+                "priced_at": now.isoformat(),
+                "prices": prices,
+            }],
+        }
+
+    # -------------------------------------------------------------------------
+    # Outcome Loop
+    # -------------------------------------------------------------------------
+
+    async def _outcome_loop(self) -> None:
+        """Background loop for outcome detection and submission."""
+        while self._running:
+            try:
+                await self._run_outcome_cycle()
+            except Exception as e:
+                self._errors_count += 1
+                bt.logging.warning({"custom_miner": "outcome_cycle_error", "error": str(e)})
+
+            await asyncio.sleep(self.config.outcome_check_seconds)
+
+    async def _run_outcome_cycle(self) -> None:
+        """Run one outcome detection cycle."""
+        # Get potentially finished events
+        events = await self._get_finished_events()
+
+        if not events:
+            return
+
+        submitted = 0
+        for event in events:
+            try:
+                result = await self._espn.get_result(event)
+                if result is None or not result.is_final:
+                    continue
+
+                # Update Elo ratings with result
+                self._update_ratings_from_result(event, result)
+
+                # Update calibration with prediction vs outcome
+                self._update_calibration_from_result(event, result)
+
+                # Submit outcome
+                payload = self._build_outcome_payload(event, result)
+                success = await self.validator_client.submit_outcome(payload)
+
+                if success:
+                    submitted += 1
+
+            except Exception as e:
+                bt.logging.debug({
+                    "custom_miner": "outcome_submission_failed",
+                    "event_id": event.get("event_id"),
+                    "error": str(e),
+                })
+
+        if submitted > 0:
+            bt.logging.info({"custom_miner": "outcomes_submitted", "count": submitted})
+
+    async def _get_finished_events(self) -> List[Dict[str, Any]]:
+        """Get events that might be finished."""
+        try:
+            # Lazy import to avoid circular dependencies
+            from sparket.miner.database.repository import get_past_events
+
+            if hasattr(self.game_sync, 'database'):
+                return await get_past_events(self.game_sync.database)
+            else:
+                # Log warning - outcome detection won't work without database
+                bt.logging.warning({
+                    "custom_miner": "outcome_detection_disabled",
+                    "reason": "game_sync has no database attribute",
+                    "impact": "Elo ratings and calibration will not update from results",
+                })
+        except ImportError:
+            bt.logging.warning({
+                "custom_miner": "outcome_detection_disabled",
+                "reason": "get_past_events import failed",
+                "impact": "Elo ratings and calibration will not update from results",
+            })
+        except Exception as e:
+            bt.logging.warning({
+                "custom_miner": "get_finished_events_error",
+                "error": str(e),
+            })
+
+        return []
+
+    def _update_ratings_from_result(
+        self,
+        event: Dict[str, Any],
+        result: Any,
+    ) -> None:
+        """Update Elo and Poisson models after a game result."""
+        try:
+            home_team = event.get("home_team", "")
+            away_team = event.get("away_team", "")
+            sport = event.get("sport", "NFL")
+            home_score = result.home_score or 0
+            away_score = result.away_score or 0
+
+            if home_team and away_team:
+                # Update Elo ratings
+                self._elo.update_ratings(
+                    home_team=home_team,
+                    away_team=away_team,
+                    sport=sport,
+                    home_score=home_score,
+                    away_score=away_score,
+                )
+
+                # Update Poisson model with scoring data
+                self._poisson.update_from_result(
+                    home_team=home_team,
+                    away_team=away_team,
+                    sport=sport,
+                    home_score=home_score,
+                    away_score=away_score,
+                )
+        except Exception as e:
+            bt.logging.debug({
+                "custom_miner": "model_update_failed",
+                "event_id": event.get("event_id"),
+                "error": str(e),
+            })
+
+    def _update_calibration_from_result(
+        self,
+        event: Dict[str, Any],
+        result: Any,
+    ) -> None:
+        """Update calibration with prediction vs actual outcome.
+
+        IMPORTANT: We train on the actual submitted probability (blended + calibrated),
+        not the raw Elo probability. This ensures the calibrator learns to correct
+        the predictions we actually make.
+        """
+        if not self.config.calibration.enabled:
+            return
+
+        try:
+            event_id = str(event.get("event_id", ""))
+
+            # Look up the probability we actually submitted for this event
+            submitted_prob = self._submitted_predictions.get(event_id)
+            if submitted_prob is None:
+                # We didn't submit a prediction for this event, skip calibration
+                bt.logging.debug({
+                    "custom_miner": "calibration_skip_no_submission",
+                    "event_id": event_id,
+                })
+                return
+
+            # Actual outcome (1 = home won, 0 = away won)
+            # Normalize winner to uppercase for comparison
+            winner = str(result.winner).upper() if result.winner else ""
+            if winner in ("HOME", "H", "1"):
+                actual = 1.0
+            elif winner in ("AWAY", "A", "2"):
+                actual = 0.0
+            else:
+                # Skip unknown/invalid outcomes - they provide no training signal
+                bt.logging.debug({
+                    "custom_miner": "calibration_skip_unknown_outcome",
+                    "event_id": event_id,
+                    "winner": winner,
+                })
+                return
+
+            # Add calibration sample using the SUBMITTED probability
+            self._calibrator.add_sample(
+                predicted=submitted_prob,
+                actual=actual,
+                market_id=event.get("market_id"),
+                sport=event.get("sport"),
+            )
+
+            # Clean up stored prediction to prevent memory buildup
+            del self._submitted_predictions[event_id]
+
+            # Periodically refit calibration
+            if self._calibrator.sample_count % self.config.calibration.retrain_interval == 0:
+                self._calibrator.fit()
+                bt.logging.info({
+                    "custom_miner": "calibration_refitted",
+                    "samples": self._calibrator.sample_count,
+                })
+
+        except Exception as e:
+            bt.logging.debug({
+                "custom_miner": "calibration_update_failed",
+                "event_id": event.get("event_id"),
+                "error": str(e),
+            })
+
+    def _build_outcome_payload(
+        self,
+        event: Dict[str, Any],
+        result: Any,
+    ) -> Dict[str, Any]:
+        """Build outcome submission payload."""
+        now = datetime.now(timezone.utc)
+
+        return {
+            "event_id": int(event.get("event_id", 0)),
+            "miner_hotkey": self.hotkey,
+            "result": result.winner,
+            "score_home": result.home_score,
+            "score_away": result.away_score,
+            "ts_submit": now.isoformat(),
+        }
+
+    # -------------------------------------------------------------------------
+    # Diagnostics
+    # -------------------------------------------------------------------------
+
+    def get_diagnostics(self) -> Dict[str, Any]:
+        """Get miner diagnostics and stats."""
+        return {
+            "running": self._running,
+            "submissions_count": self._submissions_count,
+            "errors_count": self._errors_count,
+            "calibration": self._calibrator.get_calibration_stats(),
+            "line_history": self._line_history.stats(),
+            "recent_steam_moves": len(self._line_history.get_recent_steam_moves(24.0)),
+            "originality": self._originality.stats(),
+            "ensemble": self._ensemble.get_model_stats(),
+            "odds_api": {
+                "enabled": self._odds_api is not None,
+                "remaining_requests": (
+                    self._odds_api.remaining_requests
+                    if self._odds_api else None
+                ),
+            },
+            "config": {
+                "vig": self.config.vig,
+                "refresh_interval": self.config.timing.refresh_interval_seconds,
+                "calibration_enabled": self.config.calibration.enabled,
+                "market_blend_weight": self.config.engine_weights.get("market", 0.6),
+            },
+        }
+
+
+async def main() -> None:
+    """Standalone entry point for the custom miner.
+
+    Usage:
+        python -m sparket.miner.custom.runner
+
+    Or:
+        python sparket/miner/custom/runner.py
+    """
+    import os
+    import sys
+
+    # Load configuration
+    config = CustomMinerConfig.from_env()
+
+    if not config.enabled:
+        print("Custom miner is disabled. Set SPARKET_CUSTOM_MINER__ENABLED=true")
+        sys.exit(0)
+
+    # Import bittensor components
+    try:
+        import bittensor as bt
+        from sparket.miner.client import ValidatorClient
+        from sparket.miner.sync import GameDataSync
+        from sparket.miner.database.dbm import DBM
+    except ImportError as e:
+        print(f"Failed to import dependencies: {e}")
+        print("Run: uv sync --dev")
+        sys.exit(1)
+
+    # Initialize bittensor wallet and metagraph
+    bt.logging.info("Initializing custom miner...")
+
+    # Get wallet from environment or defaults
+    wallet_name = os.getenv("BT_WALLET_NAME", "default")
+    wallet_hotkey = os.getenv("BT_WALLET_HOTKEY", "default")
+    netuid = int(os.getenv("SPARKET_NETUID", "1"))
+
+    wallet = bt.wallet(name=wallet_name, hotkey=wallet_hotkey)
+    subtensor = bt.subtensor()
+    metagraph = subtensor.metagraph(netuid=netuid)
+
+    # Initialize database using miner config
+    from sparket.miner.config.config import Config as MinerAppConfig
+    from sparket.miner.database import initialize as init_db
+
+    app_config = MinerAppConfig()
+
+    # Initialize database schema
+    try:
+        init_db(app_config)
+    except Exception as e:
+        bt.logging.warning(f"Database init warning: {e}")
+
+    # Create database manager
+    dbm = DBM(app_config)
+
+    # Create validator client and game sync
+    client = ValidatorClient(wallet=wallet, metagraph=metagraph)
+    sync = GameDataSync(database=dbm, client=client)
+
+    # Start sync
+    await sync.start()
+
+    # Create and start custom miner
+    miner = CustomMiner(
+        hotkey=wallet.hotkey.ss58_address,
+        config=config,
+        validator_client=client,
+        game_sync=sync,
+    )
+
+    await miner.start()
+
+    # Run until interrupted
+    bt.logging.info("Custom miner running. Press Ctrl+C to stop.")
+    try:
+        while True:
+            await asyncio.sleep(60)
+            # Log diagnostics every minute
+            diag = miner.get_diagnostics()
+            bt.logging.debug({"custom_miner": "diagnostics", **diag})
+    except KeyboardInterrupt:
+        bt.logging.info("Shutting down...")
+    finally:
+        await miner.stop()
+        await sync.stop()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -192,7 +192,6 @@ class GameDataSync:
             rows = await self.database.read(
                 _SELECT_ACTIVE_MARKETS,
                 params={"now": now},
-                mappings=True,
             )
             return [
                 {

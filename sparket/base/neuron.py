@@ -168,10 +168,13 @@ class BaseNeuron(ABC):
             env_wallet_hotkey = os.getenv("SPARKET_WALLET__HOTKEY")
             env_axon_port = os.getenv("SPARKET_AXON__PORT")
             env_axon_host = os.getenv("SPARKET_AXON__HOST")
+            env_netuid = os.getenv("SPARKET_NETUID")
             if env_wallet_name:
                 self.config.wallet.name = env_wallet_name
             if env_wallet_hotkey:
                 self.config.wallet.hotkey = env_wallet_hotkey
+            if env_netuid:
+                self.config.netuid = int(env_netuid)
             if env_axon_port:
                 self.config.axon.port = int(env_axon_port)
                 self.config.axon.external_port = int(env_axon_port)

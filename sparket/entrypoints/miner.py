@@ -74,6 +74,16 @@ except ImportError:
     BaseMiner = None  # type: ignore
     BaseMinerConfig = None  # type: ignore
 
+# Optional custom miner import
+try:
+    from sparket.miner.custom.runner import CustomMiner
+    from sparket.miner.custom.config import CustomMinerConfig
+    CUSTOM_MINER_AVAILABLE = True
+except ImportError:
+    CUSTOM_MINER_AVAILABLE = False
+    CustomMiner = None  # type: ignore
+    CustomMinerConfig = None  # type: ignore
+
 
 def _extract_synapse_type(synapse: SparketSynapse | None) -> str | None:
     value = getattr(synapse, "type", None)
@@ -164,11 +174,14 @@ class Miner(BaseMinerNeuron):
                 env_wallet_hotkey = os.getenv("SPARKET_WALLET__HOTKEY")
                 env_axon_port = os.getenv("SPARKET_AXON__PORT")
                 env_axon_host = os.getenv("SPARKET_AXON__HOST")
-                
+                env_netuid = os.getenv("SPARKET_NETUID")
+
                 if env_wallet_name:
                     cfg.wallet.name = env_wallet_name
                 if env_wallet_hotkey:
                     cfg.wallet.hotkey = env_wallet_hotkey
+                if env_netuid:
+                    cfg.netuid = int(env_netuid)
                 if env_axon_port:
                     cfg.axon.port = int(env_axon_port)
                     cfg.axon.external_port = int(env_axon_port)
@@ -179,7 +192,10 @@ class Miner(BaseMinerNeuron):
                 config = cfg
             except Exception:
                 pass
-        
+
+        if config is None:
+            config = BaseMinerNeuron.config()
+
         super(Miner, self).__init__(config=config)
 
         # Prevent double-logging from bittensor's standard Python logger
@@ -192,9 +208,12 @@ class Miner(BaseMinerNeuron):
         self._validator_cache: dict[str, dict[str, object]] = {}
         # Primary validator endpoint (set when CONNECTION_INFO_PUSH received)
         self.validator_endpoint: Optional[dict[str, object]] = None
-        
+
         # Base miner for automatic odds generation
         self.base_miner: Optional["BaseMiner"] = None
+
+        # Custom miner for ensemble model odds generation
+        self.custom_miner: Optional["CustomMiner"] = None
 
     async def forward(self, synapse: SparketSynapse) -> SparketSynapse:
         """Handle incoming Sparket synapses.
@@ -444,6 +463,61 @@ class Miner(BaseMinerNeuron):
         if self.base_miner is not None:
             await self.base_miner.stop()
 
+    def initialize_custom_miner(self) -> bool:
+        """Initialize the custom miner for ensemble-based odds generation.
+
+        The custom miner is disabled by default. Set SPARKET_CUSTOM_MINER__ENABLED=true to enable.
+
+        Returns:
+            True if custom miner was initialized, False otherwise.
+        """
+        if not CUSTOM_MINER_AVAILABLE:
+            bt.logging.debug({"custom_miner": "not_available"})
+            return False
+
+        custom_config = CustomMinerConfig.from_env()
+
+        if not custom_config.enabled:
+            bt.logging.debug({"custom_miner": "disabled"})
+            return False
+
+        if self.validator_client is None:
+            bt.logging.warning({"custom_miner": "validator_client_unavailable"})
+            return False
+
+        if self.game_sync is None:
+            bt.logging.warning({"custom_miner": "game_sync_unavailable"})
+            return False
+
+        try:
+            hotkey = self.wallet.hotkey.ss58_address
+            self.custom_miner = CustomMiner(
+                hotkey=hotkey,
+                config=custom_config,
+                validator_client=self.validator_client,
+                game_sync=self.game_sync,
+            )
+            bt.logging.info({
+                "custom_miner": "initialized",
+                "odds_api_key": "configured" if custom_config.odds_api_key else "not_configured",
+                "vig": custom_config.vig,
+                "engine_weights": custom_config.engine_weights,
+            })
+            return True
+        except Exception as e:
+            bt.logging.warning({"custom_miner": "init_failed", "error": str(e)})
+            return False
+
+    async def start_custom_miner(self) -> None:
+        """Start the custom miner background loops."""
+        if self.custom_miner is not None:
+            await self.custom_miner.start()
+
+    async def stop_custom_miner(self) -> None:
+        """Stop the custom miner."""
+        if self.custom_miner is not None:
+            await self.custom_miner.stop()
+
 
 # This is the main function, which runs the miner.
 async def _log_validator_endpoints(miner: Miner) -> None:
@@ -480,6 +554,18 @@ async def _stop_base_miner_async(miner: Miner) -> None:
         await miner.base_miner.stop()
 
 
+async def _start_custom_miner_async(miner: Miner) -> None:
+    """Start custom miner in async context."""
+    if miner.custom_miner is not None:
+        await miner.custom_miner.start()
+
+
+async def _stop_custom_miner_async(miner: Miner) -> None:
+    """Stop custom miner in async context."""
+    if miner.custom_miner is not None:
+        await miner.custom_miner.stop()
+
+
 if __name__ == "__main__":
     suppress_bittensor_header_warnings()
     bt.logging.setLevel("TRACE")
@@ -508,7 +594,17 @@ if __name__ == "__main__":
             bt.logging.info({"base_miner": "started"})
         except Exception as e:
             bt.logging.warning({"base_miner": "start_failed", "error": str(e)})
-    
+
+    # Initialize custom miner (disabled by default; enable with SPARKET_CUSTOM_MINER__ENABLED=true)
+    # Provides ensemble model (Elo + Market + Poisson) with calibration and originality tracking
+    custom_miner_initialized = miner.initialize_custom_miner()
+    if custom_miner_initialized:
+        try:
+            asyncio.run(_start_custom_miner_async(miner))
+            bt.logging.info({"custom_miner": "started"})
+        except Exception as e:
+            bt.logging.warning({"custom_miner": "start_failed", "error": str(e)})
+
     # Start control API for external model integration
     # Configure via SPARKET_MINER_API_PORT (default: 8198) 
     # Disable with SPARKET_MINER_API_ENABLED=false
@@ -543,7 +639,15 @@ if __name__ == "__main__":
                 bt.logging.info({"base_miner": "stopped"})
             except Exception:
                 pass
-        
+
+        # Stop custom miner
+        if miner.custom_miner is not None:
+            try:
+                asyncio.run(_stop_custom_miner_async(miner))
+                bt.logging.info({"custom_miner": "stopped"})
+            except Exception:
+                pass
+
         if control_api:
             try:
                 control_api.stop()

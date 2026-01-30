@@ -1,4 +1,4 @@
-e# Custom Miner Service Example
+# Custom Miner Service Example
 
 This example shows how to replace the base miner with your own service
 while reusing the validator client and payload formats.
