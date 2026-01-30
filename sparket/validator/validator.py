@@ -90,13 +90,7 @@ class BaseValidatorNeuron(BaseNeuron):
         # Init sync with the network. Updates the metagraph.
         self.sync()
 
-        # Serve axon to enable external connections.
-        if not self.config.neuron.axon_off:
-            self.serve_axon()
-        else:
-            bt.logging.warning("axon off, not serving ip to chain.")
-
-        # Create asyncio event loop to manage async tasks.
+        # Create asyncio event loop early - needed for database and security_manager init
         self.loop = asyncio.get_event_loop()
 
         # Instantiate runners
@@ -112,8 +106,16 @@ class BaseValidatorNeuron(BaseNeuron):
         self._sdio_ingest_running: bool = False
         self._sdio_ingest_task: asyncio.Task | None = None
 
-        # Initialize validator components (database, etc.)
+        # Initialize validator components (database, security_manager, etc.)
+        # MUST happen before serve_axon() so security middleware can be injected
         self.initialize_components()
+
+        # Serve axon to enable external connections.
+        # Security middleware is injected here using the security_manager we just created
+        if not self.config.neuron.axon_off:
+            self.serve_axon()
+        else:
+            bt.logging.warning("axon off, not serving ip to chain.")
 
     def __enter__(self):
         return self

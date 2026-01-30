@@ -66,8 +66,9 @@ class CooldownConfig:
     ip_max_cooldown_sec: int = 3600  # Max IP cooldown
     
     # Permanent blacklist thresholds
-    permanent_failure_threshold: int = 50  # Total failures across sessions
-    permanent_critical_threshold: int = 3  # Critical failures for immediate blacklist
+    # NOTE: Only CRITICAL failures (spoofing, invalid signatures, nonce replay) 
+    # trigger permanent blacklist. Regular cooldowns do NOT trigger permanent bans.
+    permanent_critical_threshold: int = 3  # Critical failures for permanent blacklist
     
     # Cleanup intervals
     cleanup_interval_sec: int = 300  # How often to clean stale entries

@@ -367,14 +367,13 @@ class SecurityManager:
                     )
         
         # Check for permanent blacklist conditions (outside lock for async DB)
+        # Only permanently blacklist for CRITICAL failures (spoofing, invalid signatures, etc.)
+        # Regular cooldowns (token issues, rate limits) should NOT trigger permanent bans
         if hotkey:
-            should_blacklist = (
-                critical_count >= cfg.permanent_critical_threshold
-                or total_cooldowns >= cfg.permanent_failure_threshold
-            )
+            should_blacklist = critical_count >= cfg.permanent_critical_threshold
             
             if should_blacklist and hotkey not in self._blacklist_hotkeys:
-                reason = f"Exceeded failure threshold: {critical_count} critical, {total_cooldowns} cooldowns"
+                reason = f"Exceeded critical failure threshold: {critical_count} critical failures"
                 await self.add_to_blacklist(
                     identifier=hotkey,
                     identifier_type="hotkey",

@@ -73,23 +73,30 @@ class Validator(BaseValidatorNeuron):
     def _do_broadcast_sync(self, axons: list, synapse: SparketSynapse) -> None:
         """
         Synchronous broadcast runner for use in a separate thread.
-        Creates its own event loop so it doesn't block the main validator loop.
+        Creates a fresh dendrite for this thread to avoid event loop conflicts.
         """
-        try:
-            # Create a new event loop for this thread
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+        async def _run_broadcast():
+            # Create a fresh dendrite for this thread's event loop
+            # This avoids "Event loop is closed" errors from cross-loop usage
+            thread_dendrite = bt.Dendrite(wallet=self.wallet)
             try:
-                responses = loop.run_until_complete(
-                    self.dendrite.forward(
-                        axons=axons,
-                        synapse=synapse,
-                        timeout=12.0,
-                        deserialize=False,
-                    )
+                return await thread_dendrite.forward(
+                    axons=axons,
+                    synapse=synapse,
+                    timeout=12.0,
+                    deserialize=False,
                 )
             finally:
-                loop.close()
+                # Clean up the thread-local dendrite
+                try:
+                    await thread_dendrite.aclose()
+                except Exception:
+                    pass
+        
+        try:
+            # asyncio.run() creates a new event loop, runs the coroutine,
+            # and properly cleans up (including pending tasks) before closing
+            responses = asyncio.run(_run_broadcast())
             
             # Categorize responses for detailed summary
             success_count = 0
@@ -150,14 +157,18 @@ class Validator(BaseValidatorNeuron):
                 
             ep = self.comms.advertised_endpoint(axon=self.axon)
             token = self.comms.current_token(step=self.step)
+            # Log token preview to confirm it's being generated (first 8 chars of 64-char hex)
+            token_preview = token[:8] + "..." if token else None
             bt.logging.info(
                 {
                     "validator_forward": {
                         "status": "broadcasting",
+                        "step": self.step,
                         "next_broadcast_in_seconds": interval,
                         "payload": {
                             "endpoint": ep,
-                            "token": "redacted" if token else None,
+                            "token_preview": token_preview,
+                            "token_length": len(token) if token else 0,
                         },
                     }
                 }

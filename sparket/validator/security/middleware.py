@@ -58,13 +58,23 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         if not self._is_synapse_endpoint(path):
             return await call_next(request)
         
+        # Log all synapse requests for debugging (TRACE level to avoid spam)
+        hotkey_short = hotkey[:16] + "..." if hotkey and len(hotkey) > 16 else hotkey
+        bt.logging.trace({
+            "security_check": {
+                "hotkey": hotkey_short,
+                "ip": ip,
+                "path": path,
+            }
+        })
+        
         # Perform security check
         allowed, reason = self.security_manager.check_request(hotkey, ip)
         
         if not allowed:
-            # Log the rejection
+            # Log the rejection at WARNING level so it's visible
             hotkey_short = hotkey[:16] + "..." if hotkey and len(hotkey) > 16 else hotkey
-            bt.logging.debug(
+            bt.logging.warning(
                 f"{LogColors.MINER_LABEL} security_rejected: "
                 f"hotkey={hotkey_short}, ip={ip}, reason={reason}"
             )
@@ -72,15 +82,35 @@ class SecurityMiddleware(BaseHTTPMiddleware):
             # Return early rejection response
             # Using 403 Forbidden for blacklist/registration
             # Using 429 Too Many Requests for cooldowns
-            status_code = 429 if reason and "cooldown" in reason else 403
+            is_cooldown = reason and "cooldown" in reason
+            status_code = 429 if is_cooldown else 403
+            
+            # Build response content
+            content: dict = {
+                "success": False,
+                "error": reason.split(":")[0] if reason else "rejected",
+                "message": self._get_rejection_message(reason),
+            }
+            
+            # Add structured cooldown info for miners to implement backoff
+            headers: dict = {}
+            if is_cooldown and reason and ":" in reason:
+                try:
+                    # reason format: "hotkey_cooldown:300s" or "ip_cooldown:300s"
+                    cooldown_type, remaining_str = reason.split(":", 1)
+                    remaining_sec = int(remaining_str.rstrip("s"))
+                    content["retry_after"] = remaining_sec
+                    content["cooldown_type"] = cooldown_type
+                    content["cooldown_remaining_seconds"] = remaining_sec
+                    # Standard HTTP header for rate limiting
+                    headers["Retry-After"] = str(remaining_sec)
+                except (ValueError, AttributeError):
+                    pass
             
             return JSONResponse(
                 status_code=status_code,
-                content={
-                    "success": False,
-                    "error": reason or "rejected",
-                    "message": self._get_rejection_message(reason),
-                },
+                content=content,
+                headers=headers if headers else None,
             )
         
         # Request passed security checks, continue to next middleware
