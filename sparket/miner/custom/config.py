@@ -147,6 +147,9 @@ class CustomMinerConfig:
     rate_limit_per_minute: int = 60
     per_market_limit_per_minute: int = 10
 
+    # Batching - number of markets to batch per submission request
+    batch_size: int = 50
+
     # Outcome checking
     outcome_check_seconds: int = 300  # 5 minutes
 
@@ -162,6 +165,7 @@ class CustomMinerConfig:
         - SPARKET_CUSTOM_MINER__TIMING__EARLY_SUBMISSION_DAYS
         - SPARKET_CUSTOM_MINER__CALIBRATION__ENABLED
         - SPARKET_CUSTOM_MINER__RATE_LIMIT_PER_MINUTE
+        - SPARKET_CUSTOM_MINER__BATCH_SIZE
         """
 
         def get_bool(key: str, default: bool) -> bool:
@@ -219,6 +223,9 @@ class CustomMinerConfig:
             retrain_interval=get_int("CALIBRATION__RETRAIN_INTERVAL", 500),
         )
 
+        batch_size = get_int("BATCH_SIZE", 50)
+        batch_size = max(1, min(200, batch_size))
+
         return cls(
             enabled=get_bool("ENABLED", True),
             elo=EloConfig(),  # Use defaults, extend as needed
@@ -229,5 +236,6 @@ class CustomMinerConfig:
             vig=get_float("VIG", 0.045),
             rate_limit_per_minute=get_int("RATE_LIMIT_PER_MINUTE", 60),
             per_market_limit_per_minute=get_int("PER_MARKET_LIMIT_PER_MINUTE", 10),
+            batch_size=batch_size,
             outcome_check_seconds=get_int("OUTCOME_CHECK_SECONDS", 300),
         )

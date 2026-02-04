@@ -491,16 +491,23 @@ class Miner(BaseMinerNeuron):
 
         try:
             hotkey = self.wallet.hotkey.ss58_address
+            # Token getter for custom miner authentication
+            def _get_token() -> Optional[str]:
+                endpoint = getattr(self, "validator_endpoint", None) or {}
+                return endpoint.get("token") if isinstance(endpoint, dict) else None
+
             self.custom_miner = CustomMiner(
                 hotkey=hotkey,
                 config=custom_config,
                 validator_client=self.validator_client,
                 game_sync=self.game_sync,
+                get_token=_get_token,
             )
             bt.logging.info({
                 "custom_miner": "initialized",
                 "odds_api_key": "configured" if custom_config.odds_api_key else "not_configured",
                 "vig": custom_config.vig,
+                "batch_size": custom_config.batch_size,
                 "engine_weights": custom_config.engine_weights,
             })
             return True

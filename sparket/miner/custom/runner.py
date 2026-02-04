@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import bittensor as bt
 
@@ -65,6 +65,7 @@ class CustomMiner:
         validator_client: Any,
         game_sync: Any,
         data_dir: Optional[str] = None,
+        get_token: Optional[Callable[[], Optional[str]]] = None,
     ) -> None:
         """Initialize the custom miner.
 
@@ -74,11 +75,13 @@ class CustomMiner:
             validator_client: Client for submitting to validators
             game_sync: GameDataSync for fetching markets
             data_dir: Directory for persistent data (ratings, calibration)
+            get_token: Callback to get the current validator push token
         """
         self.hotkey = hotkey
         self.config = config
         self.validator_client = validator_client
         self.game_sync = game_sync
+        self._get_token = get_token
 
         # Set up data directory
         if data_dir:
@@ -350,8 +353,53 @@ class CustomMiner:
             # Sleep until next refresh
             await asyncio.sleep(self.config.timing.refresh_interval_seconds)
 
+    def _record_batch_bookkeeping(
+        self,
+        batch: List[Tuple[Dict[str, Any], OddsPrices]],
+    ) -> int:
+        """Record post-submission bookkeeping for a batch of markets.
+
+        Updates timing, line history, originality tracking, and calibration
+        prediction storage for each successfully submitted market.
+
+        Args:
+            batch: List of (market, odds) tuples that were submitted
+
+        Returns:
+            Number of items processed
+        """
+        for market, odds in batch:
+            market_id = market.get("market_id", 0)
+            self._submissions_count += 1
+            self._timing.record_submission(market_id)
+
+            # Record our prediction in line history
+            self._line_history.record(
+                market_id=market_id,
+                home_prob=odds.home_prob,
+                away_prob=odds.away_prob,
+                source="prediction",
+            )
+
+            # Record for originality tracking (InfoDim)
+            market_consensus = self._line_history.get_consensus_prob(market_id)
+            if market_consensus:
+                market_home_prob, _ = market_consensus
+                self._originality.record_submission(
+                    market_id=market_id,
+                    our_prob=odds.home_prob,
+                    market_prob=market_home_prob,
+                )
+
+            # Store submitted probability for calibration training
+            event_id = market.get("event_id")
+            if event_id and odds.home_prob is not None:
+                self._submitted_predictions[str(event_id)] = odds.home_prob
+
+        return len(batch)
+
     async def _run_odds_cycle(self) -> None:
-        """Run one odds submission cycle with timing strategy."""
+        """Run one odds submission cycle with timing strategy and batching."""
         # Cleanup stale rate limit buckets to prevent memory buildup
         self._cleanup_stale_buckets()
 
@@ -378,6 +426,8 @@ class CustomMiner:
         submitted = 0
         skipped = 0
         deferred = 0
+        batches = 0
+        batch: List[Tuple[Dict[str, Any], OddsPrices]] = []
 
         for market, decision in schedule:
             market_id = market.get("market_id", 0)
@@ -418,41 +468,43 @@ class CustomMiner:
                         })
                         continue
 
-                payload = self._build_odds_payload(market, odds)
-                success = await self.validator_client.submit_odds(payload)
+                batch.append((market, odds))
 
-                if success:
-                    submitted += 1
-                    self._submissions_count += 1
-                    self._timing.record_submission(market_id)
-
-                    # Record our prediction in line history
-                    self._line_history.record(
-                        market_id=market_id,
-                        home_prob=odds.home_prob,
-                        away_prob=odds.away_prob,
-                        source="prediction",
-                    )
-
-                    # Record for originality tracking (InfoDim)
-                    market_consensus = self._line_history.get_consensus_prob(market_id)
-                    if market_consensus:
-                        market_home_prob, _ = market_consensus
-                        self._originality.record_submission(
-                            market_id=market_id,
-                            our_prob=odds.home_prob,
-                            market_prob=market_home_prob,
-                        )
-
-                    # Store submitted probability for calibration training
-                    event_id = market.get("event_id")
-                    if event_id and odds.home_prob is not None:
-                        self._submitted_predictions[str(event_id)] = odds.home_prob
+                # Submit when batch is full
+                if len(batch) >= self.config.batch_size:
+                    try:
+                        payload = self._build_batch_payload(batch)
+                        success = await self.validator_client.submit_odds(payload)
+                        if success:
+                            submitted += self._record_batch_bookkeeping(batch)
+                    except Exception as e:
+                        bt.logging.warning({
+                            "custom_miner": "batch_submission_failed",
+                            "batch_size": len(batch),
+                            "error": str(e),
+                        })
+                    batches += 1
+                    batch = []
 
             except Exception as e:
                 bt.logging.debug({
-                    "custom_miner": "market_submission_failed",
+                    "custom_miner": "market_odds_generation_failed",
                     "market_id": market.get("market_id"),
+                    "error": str(e),
+                })
+
+        # Submit remaining batch
+        if batch:
+            try:
+                payload = self._build_batch_payload(batch)
+                success = await self.validator_client.submit_odds(payload)
+                if success:
+                    submitted += self._record_batch_bookkeeping(batch)
+                batches += 1
+            except Exception as e:
+                bt.logging.warning({
+                    "custom_miner": "final_batch_failed",
+                    "batch_size": len(batch),
                     "error": str(e),
                 })
 
@@ -462,6 +514,7 @@ class CustomMiner:
                 "submitted": submitted,
                 "skipped_rate_limit": skipped,
                 "deferred_line_movement": deferred,
+                "batches": batches,
                 "total_markets": len(schedule),
             })
 
@@ -531,36 +584,66 @@ class CustomMiner:
 
         return len(stale_ids)
 
+    def _build_prices(self, market: Dict[str, Any], odds: OddsPrices) -> List[Dict[str, Any]]:
+        """Build prices list for a single market submission."""
+        kind = market.get("kind", "MONEYLINE").upper()
+
+        if kind in ("MONEYLINE", "SPREAD"):
+            return [
+                {"side": "home", "odds_eu": odds.home_odds_eu, "imp_prob": odds.home_prob},
+                {"side": "away", "odds_eu": odds.away_odds_eu, "imp_prob": odds.away_prob},
+            ]
+        elif kind == "TOTAL":
+            return [
+                {"side": "over", "odds_eu": odds.over_odds_eu or odds.home_odds_eu, "imp_prob": odds.over_prob or odds.home_prob},
+                {"side": "under", "odds_eu": odds.under_odds_eu or odds.away_odds_eu, "imp_prob": odds.under_prob or odds.away_prob},
+            ]
+        return []
+
+    def _build_batch_payload(
+        self,
+        markets_with_odds: List[Tuple[Dict[str, Any], OddsPrices]],
+    ) -> Dict[str, Any]:
+        """Build batched odds submission payload.
+
+        Args:
+            markets_with_odds: List of (market, odds) tuples
+
+        Returns:
+            Payload dict with multiple submissions and optional token
+        """
+        now = datetime.now(timezone.utc)
+
+        submissions = []
+        for market, odds in markets_with_odds:
+            kind = market.get("kind", "MONEYLINE").upper()
+            submissions.append({
+                "market_id": int(market.get("market_id", 0)),
+                "kind": kind.lower(),
+                "priced_at": now.isoformat(),
+                "prices": self._build_prices(market, odds),
+            })
+
+        payload: Dict[str, Any] = {
+            "miner_hotkey": self.hotkey,
+            "submissions": submissions,
+        }
+
+        # Include token for authentication
+        if self._get_token is not None:
+            token = self._get_token()
+            if token:
+                payload["token"] = token
+
+        return payload
+
     def _build_odds_payload(
         self,
         market: Dict[str, Any],
         odds: OddsPrices,
     ) -> Dict[str, Any]:
-        """Build odds submission payload."""
-        now = datetime.now(timezone.utc)
-        kind = market.get("kind", "MONEYLINE").upper()
-
-        prices = []
-        if kind in ("MONEYLINE", "SPREAD"):
-            prices = [
-                {"side": "home", "odds_eu": odds.home_odds_eu, "imp_prob": odds.home_prob},
-                {"side": "away", "odds_eu": odds.away_odds_eu, "imp_prob": odds.away_prob},
-            ]
-        elif kind == "TOTAL":
-            prices = [
-                {"side": "over", "odds_eu": odds.over_odds_eu or odds.home_odds_eu, "imp_prob": odds.over_prob or odds.home_prob},
-                {"side": "under", "odds_eu": odds.under_odds_eu or odds.away_odds_eu, "imp_prob": odds.under_prob or odds.away_prob},
-            ]
-
-        return {
-            "miner_hotkey": self.hotkey,
-            "submissions": [{
-                "market_id": int(market.get("market_id", 0)),
-                "kind": kind.lower(),
-                "priced_at": now.isoformat(),
-                "prices": prices,
-            }],
-        }
+        """Build odds submission payload for a single market."""
+        return self._build_batch_payload([(market, odds)])
 
     # -------------------------------------------------------------------------
     # Outcome Loop
@@ -759,7 +842,7 @@ class CustomMiner:
         """Build outcome submission payload."""
         now = datetime.now(timezone.utc)
 
-        return {
+        payload: Dict[str, Any] = {
             "event_id": int(event.get("event_id", 0)),
             "miner_hotkey": self.hotkey,
             "result": result.winner,
@@ -767,6 +850,14 @@ class CustomMiner:
             "score_away": result.away_score,
             "ts_submit": now.isoformat(),
         }
+
+        # Include token for authentication
+        if self._get_token is not None:
+            token = self._get_token()
+            if token:
+                payload["token"] = token
+
+        return payload
 
     # -------------------------------------------------------------------------
     # Diagnostics
@@ -795,6 +886,7 @@ class CustomMiner:
                 "refresh_interval": self.config.timing.refresh_interval_seconds,
                 "calibration_enabled": self.config.calibration.enabled,
                 "market_blend_weight": self.config.engine_weights.get("market", 0.6),
+                "batch_size": self.config.batch_size,
             },
         }
 
