@@ -156,6 +156,11 @@ class CustomMiner:
         # Track submitted predictions for calibration training and CLV
         # Key: event_id, Value: (home_prob, home_odds_eu, timestamp)
         self._submitted_predictions: Dict[str, Tuple[float, float, float]] = {}
+        # Track submitted market metadata for ESPN-based outcome fallback
+        # Key: event_id, Value: dict with home_team, away_team, sport, start_time_utc, market_id
+        self._submitted_events: Dict[str, Dict[str, Any]] = {}
+        # Track event_ids whose outcomes have already been processed
+        self._processed_outcomes: set = set()
         # Track previous market odds for recording market moves (lead ratio)
         self._previous_market_odds: Dict[int, float] = {}
 
@@ -441,11 +446,22 @@ class CustomMiner:
             # Store submitted probability, odds, and timestamp for calibration + CLV
             event_id = market.get("event_id")
             if event_id and odds.home_prob is not None:
-                self._submitted_predictions[str(event_id)] = (
+                eid = str(event_id)
+                self._submitted_predictions[eid] = (
                     odds.home_prob,
                     odds.home_odds_eu,
                     _time.time(),
                 )
+                # Store event metadata for ESPN-based outcome fallback
+                if eid not in self._submitted_events:
+                    self._submitted_events[eid] = {
+                        "event_id": event_id,
+                        "market_id": market.get("market_id"),
+                        "home_team": market.get("home_team", ""),
+                        "away_team": market.get("away_team", ""),
+                        "sport": market.get("sport", "NFL"),
+                        "start_time_utc": market.get("start_time_utc"),
+                    }
 
         return len(batch)
 
@@ -460,6 +476,9 @@ class CustomMiner:
 
         # Cleanup old line history (markets that finished)
         self._line_history.cleanup_old_markets()
+
+        # Cleanup stale submitted predictions (14-day TTL)
+        self._cleanup_stale_predictions()
 
         # Get active markets
         markets = await self.game_sync.get_active_markets()
@@ -653,6 +672,55 @@ class CustomMiner:
 
         return len(stale_ids)
 
+    def _cleanup_stale_predictions(self, max_age_seconds: float = 14 * 86400) -> int:
+        """Remove submitted prediction entries older than max_age_seconds.
+
+        Prevents unbounded memory growth when the outcome loop fails
+        to process events (e.g., database unavailable, ESPN lookup miss).
+
+        Also cleans up related _submitted_events and _processed_outcomes.
+
+        Args:
+            max_age_seconds: Remove entries older than this (default: 14 days)
+
+        Returns:
+            Number of entries removed
+        """
+        now = _time.time()
+        stale_keys = [
+            key
+            for key, (_, _, ts) in self._submitted_predictions.items()
+            if (now - ts) > max_age_seconds
+        ]
+
+        for key in stale_keys:
+            del self._submitted_predictions[key]
+            self._submitted_events.pop(key, None)
+
+        # Also prune _submitted_events that have no prediction (orphaned)
+        orphaned = [k for k in self._submitted_events if k not in self._submitted_predictions]
+        for key in orphaned:
+            del self._submitted_events[key]
+
+        # Cap _processed_outcomes to prevent unbounded growth (keep last 10k)
+        if len(self._processed_outcomes) > 10000:
+            # Can't easily age a set, just trim to recent half
+            excess = len(self._processed_outcomes) - 5000
+            it = iter(self._processed_outcomes)
+            for _ in range(excess):
+                self._processed_outcomes.discard(next(it))
+
+        removed = len(stale_keys) + len(orphaned)
+        if removed:
+            bt.logging.debug({
+                "custom_miner": "stale_predictions_cleanup",
+                "removed_predictions": len(stale_keys),
+                "removed_orphaned_events": len(orphaned),
+                "remaining_predictions": len(self._submitted_predictions),
+            })
+
+        return removed
+
     def _build_prices(self, market: Dict[str, Any], odds: OddsPrices) -> List[Dict[str, Any]]:
         """Build prices list for a single market submission."""
         kind = market.get("kind", "MONEYLINE").upper()
@@ -768,33 +836,62 @@ class CustomMiner:
             bt.logging.info({"custom_miner": "outcomes_submitted", "count": submitted})
 
     async def _get_finished_events(self) -> List[Dict[str, Any]]:
-        """Get events that might be finished."""
+        """Get events that might be finished.
+
+        Tries the database repository first (most complete data).
+        Falls back to in-memory tracked events filtered by start time,
+        so outcomes can still be detected via ESPN even when the
+        database is unavailable.
+        """
+        # Try database first
         try:
-            # Lazy import to avoid circular dependencies
             from sparket.miner.database.repository import get_past_events
 
-            if hasattr(self.game_sync, 'database'):
-                return await get_past_events(self.game_sync.database)
-            else:
-                # Log warning - outcome detection won't work without database
-                bt.logging.warning({
-                    "custom_miner": "outcome_detection_disabled",
-                    "reason": "game_sync has no database attribute",
-                    "impact": "Elo ratings and calibration will not update from results",
-                })
+            if hasattr(self.game_sync, 'database') and self.game_sync.database is not None:
+                db_events = await get_past_events(self.game_sync.database)
+                if db_events:
+                    return db_events
         except ImportError:
-            bt.logging.warning({
-                "custom_miner": "outcome_detection_disabled",
-                "reason": "get_past_events import failed",
-                "impact": "Elo ratings and calibration will not update from results",
-            })
+            pass
         except Exception as e:
-            bt.logging.warning({
-                "custom_miner": "get_finished_events_error",
+            bt.logging.debug({
+                "custom_miner": "db_outcome_lookup_failed",
                 "error": str(e),
             })
 
-        return []
+        # Fallback: use in-memory tracked events whose start_time is in the past
+        now = datetime.now(timezone.utc)
+        candidates = []
+        for eid, meta in self._submitted_events.items():
+            if eid in self._processed_outcomes:
+                continue
+
+            start_time = meta.get("start_time_utc")
+            if start_time is None:
+                continue
+
+            if isinstance(start_time, str):
+                try:
+                    start_time = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+
+            if hasattr(start_time, 'tzinfo') and start_time.tzinfo is None:
+                start_time = start_time.replace(tzinfo=timezone.utc)
+
+            # Only check events that started at least 2 hours ago (likely finished)
+            # and no more than 48 hours ago (avoid very old events)
+            hours_since = (now - start_time).total_seconds() / 3600
+            if 2.0 <= hours_since <= 48.0:
+                candidates.append(meta)
+
+        if candidates:
+            bt.logging.debug({
+                "custom_miner": "outcome_fallback_candidates",
+                "count": len(candidates),
+            })
+
+        return candidates
 
     def _update_ratings_from_result(
         self,
@@ -912,8 +1009,10 @@ class CustomMiner:
                         "clv_prob": round(clv_prob, 4),
                     })
 
-            # Clean up stored prediction to prevent memory buildup
+            # Clean up stored prediction and mark outcome as processed
             del self._submitted_predictions[event_id]
+            self._submitted_events.pop(event_id, None)
+            self._processed_outcomes.add(event_id)
 
             # Periodically refit calibration
             if self._calibrator.sample_count % self.config.calibration.retrain_interval == 0:

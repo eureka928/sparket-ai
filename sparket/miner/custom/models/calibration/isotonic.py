@@ -258,21 +258,21 @@ class IsotonicCalibrator:
     ) -> Tuple[float, float]:
         """Calibrate a pair of probabilities, maintaining sum = 1.
 
+        Only calibrates home_prob and derives away as 1 - cal_home.
+        Calibrating both independently and normalizing introduces bias
+        because the isotonic model was fit on individual predictions,
+        not pairs. Normalizing shifts both values away from their
+        calibrated targets.
+
         Args:
             home_prob: Raw home win probability
-            away_prob: Raw away win probability
+            away_prob: Raw away win probability (unused, derived from home)
 
         Returns:
             Tuple of (calibrated_home, calibrated_away)
         """
         cal_home = self.calibrate(home_prob)
-        cal_away = self.calibrate(away_prob)
-
-        # Normalize to sum to 1
-        total = cal_home + cal_away
-        if total > 0:
-            cal_home /= total
-            cal_away /= total
+        cal_away = 1.0 - cal_home
 
         return cal_home, cal_away
 
