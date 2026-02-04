@@ -8,7 +8,7 @@ The scoring system applies time bonuses/penalties:
 
 Strategy:
 1. Submit as early as possible (7+ days)
-2. Update predictions every 6 hours
+2. Adaptive refresh: 5min (≤6h), 30min (≤24h), 1h (≤72h), 6h (>72h)
 3. Never submit within 2 hours of event start
 """
 
@@ -131,6 +131,8 @@ class TimingStrategy:
         # Check if we've submitted before
         last_sub = last_submission or self._submissions.get(market_id)
 
+        adaptive_refresh = self._adaptive_refresh_seconds(hours_until)
+
         if last_sub is None:
             # First submission - always do it
             priority = self._calculate_priority(hours_until, time_credit)
@@ -138,13 +140,13 @@ class TimingStrategy:
                 decision=SubmissionDecision.SUBMIT_NOW,
                 reason="Initial submission",
                 time_credit=time_credit,
-                next_check_seconds=self.config.refresh_interval_seconds,
+                next_check_seconds=adaptive_refresh,
                 priority=priority,
             )
 
         # Check if enough time has passed since last submission
         since_last = now - last_sub
-        refresh_delta = timedelta(seconds=self.config.refresh_interval_seconds)
+        refresh_delta = timedelta(seconds=adaptive_refresh)
 
         if since_last >= refresh_delta:
             priority = self._calculate_priority(hours_until, time_credit)
@@ -152,7 +154,7 @@ class TimingStrategy:
                 decision=SubmissionDecision.UPDATE,
                 reason=f"Refresh interval ({since_last.total_seconds() / 3600:.1f}h since last)",
                 time_credit=time_credit,
-                next_check_seconds=self.config.refresh_interval_seconds,
+                next_check_seconds=adaptive_refresh,
                 priority=priority,
             )
 
@@ -165,6 +167,29 @@ class TimingStrategy:
             next_check_seconds=wait_seconds,
             priority=0,
         )
+
+    def _adaptive_refresh_seconds(self, hours_until: float) -> int:
+        """Calculate adaptive refresh interval based on proximity to game.
+
+        Closer games refresh more frequently to capture market movement
+        and improve lead ratio and time credit.
+
+        Args:
+            hours_until: Hours until event start
+
+        Returns:
+            Refresh interval in seconds
+        """
+        min_refresh = self.config.min_refresh_seconds
+
+        if hours_until <= 6:
+            return min_refresh
+        elif hours_until <= 24:
+            return max(min_refresh, 1800)
+        elif hours_until <= 72:
+            return max(min_refresh, 3600)
+        else:
+            return self.config.refresh_interval_seconds
 
     def _calculate_time_credit(self, hours_until: float) -> float:
         """Calculate expected time credit based on hours until event.

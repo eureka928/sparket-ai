@@ -9,12 +9,13 @@ Key strategies:
 1. Enhanced Elo model for probability estimation
 2. Isotonic calibration for accuracy
 3. Strategic timing for maximum time credit
-4. (Future) Originality tracking for InfoDim
+4. Originality tracking for InfoDim
 """
 
 from __future__ import annotations
 
 import asyncio
+import time as _time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -152,9 +153,11 @@ class CustomMiner:
         self._tasks: List[asyncio.Task] = []
         self._submissions_count = 0
         self._errors_count = 0
-        # Track submitted predictions for calibration training
-        # Key: event_id, Value: submitted home probability
-        self._submitted_predictions: Dict[str, float] = {}
+        # Track submitted predictions for calibration training and CLV
+        # Key: event_id, Value: (home_prob, home_odds_eu, timestamp)
+        self._submitted_predictions: Dict[str, Tuple[float, float, float]] = {}
+        # Track previous market odds for recording market moves (lead ratio)
+        self._previous_market_odds: Dict[int, float] = {}
 
     @property
     def is_running(self) -> bool:
@@ -229,6 +232,7 @@ class CustomMiner:
         Pipeline:
         1. Fetch market consensus from The-Odds-API (if available)
         2. Use ensemble engine to combine Elo + Market + Poisson
+        2b. Apply originality adjustment for InfoDim SOS
         3. Apply isotonic calibration
         4. Convert to odds with vig
 
@@ -263,6 +267,15 @@ class CustomMiner:
                             away_prob=1.0 - market_odds.home_prob,
                             source="market",
                         )
+                        # Record market move for lead ratio (InfoDim)
+                        old_market_prob = self._previous_market_odds.get(int(market_id))
+                        if old_market_prob is not None:
+                            self._originality.record_market_move(
+                                market_id=int(market_id),
+                                old_prob=old_market_prob,
+                                new_prob=market_odds.home_prob,
+                            )
+                        self._previous_market_odds[int(market_id)] = market_odds.home_prob
             except Exception as e:
                 bt.logging.debug({
                     "custom_miner": "market_odds_error",
@@ -280,6 +293,33 @@ class CustomMiner:
 
         cal_home = ensemble_pred.home_prob
         cal_away = ensemble_pred.away_prob
+
+        # 2b. Apply originality adjustment for InfoDim SOS
+        diff_decision = None
+        market_consensus_prob = None
+        if market_odds is not None:
+            market_consensus_prob = market_odds.home_prob
+        if market_consensus_prob is not None:
+            start_time = market.get("start_time_utc")
+            hours_to_game = 24.0
+            if start_time:
+                now = datetime.now(timezone.utc)
+                if isinstance(start_time, str):
+                    start_time = datetime.fromisoformat(
+                        start_time.replace("Z", "+00:00")
+                    )
+                hours_to_game = max(0.0, (start_time - now).total_seconds() / 3600)
+
+            diff_decision = self._originality.should_differentiate(
+                market_id=int(market.get("market_id", 0)),
+                our_prob=cal_home,
+                market_prob=market_consensus_prob,
+                confidence=ensemble_pred.confidence,
+                hours_to_game=hours_to_game,
+            )
+            if diff_decision.suggested_adjustment != 0.0:
+                cal_home = max(0.001, min(0.999, cal_home + diff_decision.suggested_adjustment))
+                cal_away = 1.0 - cal_home
 
         # 3. Apply calibration if enabled and fitted
         if self.config.calibration.enabled and self._calibrator.is_fitted:
@@ -320,6 +360,8 @@ class CustomMiner:
             "dominant_source": ensemble_pred.dominant_source,
             "models_agreed": ensemble_pred.models_agreed,
             "calibration_applied": self._calibrator.is_fitted,
+            "originality_adj": round(diff_decision.suggested_adjustment, 4) if diff_decision is not None else None,
+            "originality_reason": diff_decision.reason if diff_decision is not None else None,
         })
 
         return calibrated_odds
@@ -344,14 +386,19 @@ class CustomMiner:
     async def _odds_loop(self) -> None:
         """Background loop for odds submission."""
         while self._running:
+            min_sleep: Optional[int] = None
             try:
-                await self._run_odds_cycle()
+                min_sleep = await self._run_odds_cycle()
             except Exception as e:
                 self._errors_count += 1
                 bt.logging.warning({"custom_miner": "odds_cycle_error", "error": str(e)})
 
-            # Sleep until next refresh
-            await asyncio.sleep(self.config.timing.refresh_interval_seconds)
+            # Adaptive sleep: use minimum next_check from cycle, floored by min_refresh
+            if min_sleep is not None:
+                sleep_seconds = max(self.config.timing.min_refresh_seconds, min_sleep)
+            else:
+                sleep_seconds = self.config.timing.refresh_interval_seconds
+            await asyncio.sleep(sleep_seconds)
 
     def _record_batch_bookkeeping(
         self,
@@ -391,15 +438,23 @@ class CustomMiner:
                     market_prob=market_home_prob,
                 )
 
-            # Store submitted probability for calibration training
+            # Store submitted probability, odds, and timestamp for calibration + CLV
             event_id = market.get("event_id")
             if event_id and odds.home_prob is not None:
-                self._submitted_predictions[str(event_id)] = odds.home_prob
+                self._submitted_predictions[str(event_id)] = (
+                    odds.home_prob,
+                    odds.home_odds_eu,
+                    _time.time(),
+                )
 
         return len(batch)
 
-    async def _run_odds_cycle(self) -> None:
-        """Run one odds submission cycle with timing strategy and batching."""
+    async def _run_odds_cycle(self) -> Optional[int]:
+        """Run one odds submission cycle with timing strategy and batching.
+
+        Returns:
+            Minimum next_check_seconds from timing decisions, or None if no markets.
+        """
         # Cleanup stale rate limit buckets to prevent memory buildup
         self._cleanup_stale_buckets()
 
@@ -411,7 +466,13 @@ class CustomMiner:
 
         if not markets:
             bt.logging.debug({"custom_miner": "no_active_markets"})
-            return
+            return None
+
+        # Prune previous market odds to active markets only
+        active_ids = {int(m.get("market_id", 0)) for m in markets}
+        stale_odds = [k for k in self._previous_market_odds if k not in active_ids]
+        for k in stale_odds:
+            del self._previous_market_odds[k]
 
         # Enrich markets with event data for timing
         enriched_markets = await self._enrich_markets(markets)
@@ -421,7 +482,14 @@ class CustomMiner:
 
         if not schedule:
             bt.logging.debug({"custom_miner": "no_markets_due_for_submission"})
-            return
+            return None
+
+        # Track minimum next_check from timing decisions for adaptive sleep
+        min_next_check: Optional[int] = None
+        for _, decision in schedule:
+            if decision.next_check_seconds > 0:
+                if min_next_check is None or decision.next_check_seconds < min_next_check:
+                    min_next_check = decision.next_check_seconds
 
         submitted = 0
         skipped = 0
@@ -518,6 +586,8 @@ class CustomMiner:
                 "total_markets": len(schedule),
             })
 
+        return min_next_check
+
     async def _enrich_markets(
         self,
         markets: List[Dict[str, Any]],
@@ -564,8 +634,7 @@ class CustomMiner:
         Returns:
             Number of buckets removed
         """
-        import time
-        now = time.time()
+        now = _time.time()
         stale_ids = [
             market_id
             for market_id, bucket in self._per_market_buckets.items()
@@ -783,14 +852,16 @@ class CustomMiner:
             event_id = str(event.get("event_id", ""))
 
             # Look up the probability we actually submitted for this event
-            submitted_prob = self._submitted_predictions.get(event_id)
-            if submitted_prob is None:
+            submitted_record = self._submitted_predictions.get(event_id)
+            if submitted_record is None:
                 # We didn't submit a prediction for this event, skip calibration
                 bt.logging.debug({
                     "custom_miner": "calibration_skip_no_submission",
                     "event_id": event_id,
                 })
                 return
+
+            submitted_prob, submitted_odds, submit_ts = submitted_record
 
             # Actual outcome (1 = home won, 0 = away won)
             # Normalize winner to uppercase for comparison
@@ -815,6 +886,31 @@ class CustomMiner:
                 market_id=event.get("market_id"),
                 sport=event.get("sport"),
             )
+
+            # Compute CLV for observational logging (EconDim visibility)
+            # Uses same formulas as validator: sparket/validator/scoring/metrics/clv.py
+            market_id = event.get("market_id")
+            if market_id:
+                closing_consensus = self._line_history.get_consensus_prob(market_id)
+                if closing_consensus:
+                    closing_home_prob, _ = closing_consensus
+                    closing_odds = 1.0 / max(0.001, closing_home_prob)
+                    # CLE = miner_odds * truth_prob - 1.0
+                    cle = submitted_odds * closing_home_prob - 1.0
+                    cle = max(-1.0, min(1.0, cle))
+                    # CLV_prob = (truth_prob - miner_prob) / truth_prob
+                    clv_prob = (closing_home_prob - submitted_prob) / closing_home_prob if closing_home_prob > 0 else 0.0
+                    bt.logging.info({
+                        "custom_miner": "clv_observation",
+                        "event_id": event_id,
+                        "market_id": market_id,
+                        "submitted_prob": round(submitted_prob, 4),
+                        "submitted_odds": round(submitted_odds, 2),
+                        "closing_prob": round(closing_home_prob, 4),
+                        "closing_odds": round(closing_odds, 2),
+                        "cle": round(cle, 4),
+                        "clv_prob": round(clv_prob, 4),
+                    })
 
             # Clean up stored prediction to prevent memory buildup
             del self._submitted_predictions[event_id]

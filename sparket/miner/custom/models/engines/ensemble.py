@@ -15,7 +15,7 @@ Usage:
     ensemble = EnsembleEngine(
         elo_engine=elo,
         poisson_engine=poisson,
-        base_weights={"elo": 0.3, "market": 0.6, "poisson": 0.1},
+        base_weights={"elo": 0.5, "market": 0.35, "poisson": 0.15},
     )
 
     prediction = await ensemble.predict(
@@ -128,16 +128,16 @@ class EnsembleEngine:
         Args:
             elo_engine: EloEngine instance
             poisson_engine: PoissonEngine instance
-            base_weights: Base weights for each model {"elo": 0.3, "market": 0.6, "poisson": 0.1}
+            base_weights: Base weights for each model {"elo": 0.5, "market": 0.35, "poisson": 0.15}
             confidence_scaling: Whether to adjust weights by confidence
         """
         self._elo = elo_engine
         self._poisson = poisson_engine
 
         self._base_weights = base_weights or {
-            "elo": 0.35,
-            "market": 0.55,
-            "poisson": 0.10,
+            "elo": 0.50,
+            "market": 0.35,
+            "poisson": 0.15,
         }
 
         self._confidence_scaling = confidence_scaling

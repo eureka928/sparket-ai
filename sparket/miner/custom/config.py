@@ -77,6 +77,9 @@ class TimingConfig:
     # Don't submit if less than this many hours before
     cutoff_hours: float = 0.5
 
+    # Minimum refresh interval for adaptive timing (seconds)
+    min_refresh_seconds: int = 300
+
 
 @dataclass
 class CalibrationConfig:
@@ -212,6 +215,10 @@ class CustomMinerConfig:
             cutoff_hours=get_float(
                 "TIMING__CUTOFF_HOURS",
                 TimingConfig.cutoff_hours
+            ),
+            min_refresh_seconds=get_int(
+                "TIMING__MIN_REFRESH_SECONDS",
+                TimingConfig.min_refresh_seconds
             ),
         )
 
