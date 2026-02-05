@@ -642,7 +642,7 @@ class BaseValidatorNeuron(BaseNeuron):
                 **endpoint,
                 "token": token,
                 "hotkey": self.wallet.hotkey.ss58_address,
-                "step": step,  # Still included for miner reference
+                "step": step,
             }
             
             # Create synapse
