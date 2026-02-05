@@ -15,7 +15,10 @@ from sparket.validator.events.miner_events import MinerOddsPushed
 from sparket.validator.config.scoring_params import get_scoring_params
 from sparket.validator.scoring.validation import get_validator
 from sparket.validator.scoring.types import ValidationError
+from sparket.shared.enums import PriceSide
 from sparket.shared.rows import MinerSubmissionRow
+
+_VALID_SIDES = {s.value for s in PriceSide}
 
 
 # Configuration
@@ -123,7 +126,11 @@ def _coerce_submit_odds_to_rows(
         prices = sub.get("prices", []) or []
         
         for price in prices:
-            side = price.get("side")
+            side_raw = price.get("side")
+            if not isinstance(side_raw, str) or side_raw.lower() not in _VALID_SIDES:
+                bt.logging.debug({"ingest_odds_skip": "invalid_side", "side": side_raw})
+                continue
+            side = side_raw.upper()
             try:
                 odds_eu = float(price.get("odds_eu", 0))
                 imp_prob = _compute_imp_prob(odds_eu, price.get("imp_prob"))
