@@ -1,6 +1,6 @@
 [project]
 name = "sparket-subnet"
-version = "0.0.2"
+version = "0.0.3"
 description = "sparket-subnet"
 readme = "README.md"
 license = "MIT"
@@ -29,6 +29,7 @@ dependencies = [
     "httpx>=0.27.0",
     "psutil>=7.2.1",
     "scipy>=1.15.3",
+    "aiohttp>=3.13.3",
 ]
 
 [project.scripts]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -128,6 +129,26 @@ class MainScoreHandler:
                         "error": str(e)
                     })
 
+            # Phase 2.5: Export ledger data (if enabled)
+            # Checkpoint: only after SkillScoreJob ran (rolling scores changed)
+            # Delta: only if new outcomes were scored this cycle
+            try:
+                ledger_enabled = bool(os.environ.get("SPARKET_LEDGER__ENABLED", "").lower() in ("true", "1", "yes"))
+                if ledger_enabled and validator is not None:
+                    skill_ran = results["jobs_completed"] > 0
+                    new_outcomes = results.get("outcome_scored", 0) > 0
+                    await self._export_ledger(
+                        validator,
+                        export_checkpoint=skill_ran,
+                        export_delta=new_outcomes,
+                    )
+                    results["ledger_checkpoint"] = skill_ran
+                    results["ledger_delta"] = new_outcomes
+            except Exception as e:
+                bt.logging.warning({"main_score_ledger_error": str(e)})
+                results["ledger_checkpoint"] = False
+                results["ledger_delta"] = False
+
             # Phase 3: Emit weights if requested
             if emit_weights and validator is not None:
                 try:
@@ -159,6 +180,65 @@ class MainScoreHandler:
             return results
         finally:
             bt.logging.info({"main_score": "end"})
+
+    async def _export_ledger(
+        self,
+        validator: Any,
+        export_checkpoint: bool = True,
+        export_delta: bool = True,
+    ) -> None:
+        """Export ledger data after scoring completes.
+
+        Only exports when data has actually changed:
+        - Checkpoint: after batch scoring jobs update miner_rolling_score
+        - Delta: when new outcomes were scored this cycle
+        """
+        if not export_checkpoint and not export_delta:
+            return
+
+        from sparket.validator.ledger.exporter import LedgerExporter
+        from sparket.validator.ledger.store.filesystem import FilesystemStore
+
+        data_dir = os.environ.get("SPARKET_LEDGER__DATA_DIR", "sparket/data/ledger")
+        netuid = getattr(validator.config, "netuid", 57)
+
+        exporter = LedgerExporter(
+            database=self.database,
+            wallet=validator.wallet,
+            netuid=netuid,
+        )
+        store = FilesystemStore(data_dir=data_dir)
+
+        cp_miners = 0
+        delta_subs = 0
+
+        if export_checkpoint:
+            checkpoint = await exporter.export_checkpoint()
+            await store.put_checkpoint(checkpoint)
+            cp_miners = len(checkpoint.accumulators)
+
+        if export_delta:
+            from sqlalchemy import text
+            rows = await self.database.read(
+                text("SELECT last_delta_at FROM ledger_state WHERE id = 1"),
+                mappings=True,
+            )
+            last_delta_at = rows[0]["last_delta_at"] if rows else None
+            since = last_delta_at or (datetime.now(timezone.utc) - timedelta(hours=12))
+
+            delta = await exporter.export_delta(since=since)
+            if delta.settled_submissions:  # Only write if there's actual data
+                await store.put_delta(delta)
+                delta_subs = len(delta.settled_submissions)
+
+        bt.logging.info({
+            "ledger_export": {
+                "checkpoint": export_checkpoint,
+                "checkpoint_miners": cp_miners,
+                "delta": export_delta,
+                "delta_submissions": delta_subs,
+            }
+        })
 
     async def run_snapshots(self) -> dict:
         """Run only the ground truth snapshot pipeline."""

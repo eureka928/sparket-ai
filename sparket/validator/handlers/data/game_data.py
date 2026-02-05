@@ -33,7 +33,6 @@ def _build_db_url() -> str:
 
 
 # Query for upcoming games with team names and league/sport info
-# Uses COALESCE to fall back to ext_ref team names when team IDs aren't linked
 _SELECT_UPCOMING_GAMES = text(
     """
     SELECT 
@@ -43,8 +42,8 @@ _SELECT_UPCOMING_GAMES = text(
         e.start_time_utc,
         l.code AS league_code,
         s.code AS sport_code,
-        COALESCE(home.name, e.ext_ref->'sportsdataio'->>'HomeTeam') AS home_team,
-        COALESCE(away.name, e.ext_ref->'sportsdataio'->>'AwayTeam') AS away_team
+        home.name AS home_team,
+        away.name AS away_team
     FROM event e
     JOIN league l ON e.league_id = l.league_id
     JOIN sport s ON l.sport_id = s.sport_id

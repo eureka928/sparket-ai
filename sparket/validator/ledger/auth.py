@@ -1,0 +1,217 @@
+"""Ledger access policy: challenge-response auth with vpermit + stake gate.
+
+Validators must prove hotkey ownership via signed challenge, and meet
+minimum requirements (validator_permit=True, stake >= threshold) to
+receive a bearer token for ledger access.
+"""
+
+from __future__ import annotations
+
+import os
+import secrets
+import time
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from typing import Any
+
+import bittensor as bt
+
+
+@dataclass
+class EligibilityResult:
+    """Result of an eligibility check."""
+
+    eligible: bool
+    reason: str = ""
+
+
+@dataclass
+class _PendingChallenge:
+    """A nonce waiting for response."""
+
+    nonce: str
+    hotkey: str
+    created_at: float
+    ttl: float = 120.0  # 2 minutes to respond
+
+    @property
+    def expired(self) -> bool:
+        return time.time() > self.created_at + self.ttl
+
+
+@dataclass
+class _TokenEntry:
+    """An issued bearer token."""
+
+    hotkey: str
+    created_at: float
+    ttl: float
+
+    @property
+    def expired(self) -> bool:
+        return time.time() > self.created_at + self.ttl
+
+
+class AccessPolicy:
+    """Challenge-response auth with metagraph-based eligibility checks.
+
+    Fail-closed: any verification failure = reject.
+    """
+
+    def __init__(
+        self,
+        metagraph: Any,
+        min_stake_threshold: int = 100_000,
+        token_ttl: int = 3600,
+        rate_limit_per_hour: int = 60,
+        max_tokens: int = 500,
+    ):
+        self.metagraph = metagraph
+        self.min_stake_threshold = min_stake_threshold
+        self.token_ttl = token_ttl
+        self.rate_limit_per_hour = rate_limit_per_hour
+        self.max_tokens = max_tokens
+
+        # Pending challenges: nonce -> _PendingChallenge
+        self._challenges: dict[str, _PendingChallenge] = {}
+        # Issued tokens: token -> _TokenEntry (LRU via OrderedDict)
+        self._tokens: OrderedDict[str, _TokenEntry] = OrderedDict()
+        # Rate limiting: hotkey -> list of request timestamps
+        self._request_log: dict[str, list[float]] = {}
+
+    def update_metagraph(self, metagraph: Any) -> None:
+        """Update the metagraph reference (called after resync)."""
+        self.metagraph = metagraph
+
+    # -- Eligibility --
+
+    def check_eligibility(self, hotkey: str) -> EligibilityResult:
+        """Check if a hotkey meets ledger access requirements.
+
+        Requirements:
+        1. Hotkey exists in metagraph
+        2. validator_permit == True
+        3. stake >= min_stake_threshold
+        """
+        if not hotkey:
+            return EligibilityResult(eligible=False, reason="empty_hotkey")
+
+        try:
+            hotkeys = list(self.metagraph.hotkeys)
+        except Exception:
+            return EligibilityResult(eligible=False, reason="metagraph_unavailable")
+
+        if hotkey not in hotkeys:
+            return EligibilityResult(eligible=False, reason="hotkey_not_found")
+
+        idx = hotkeys.index(hotkey)
+
+        # Check validator_permit
+        try:
+            vpermit = bool(self.metagraph.validator_permit[idx])
+        except (IndexError, AttributeError):
+            return EligibilityResult(eligible=False, reason="vpermit_check_failed")
+
+        if not vpermit:
+            return EligibilityResult(eligible=False, reason="no_validator_permit")
+
+        # Check stake
+        try:
+            stake = float(self.metagraph.S[idx])
+        except (IndexError, AttributeError):
+            try:
+                stake = float(self.metagraph.stake[idx])
+            except (IndexError, AttributeError):
+                return EligibilityResult(eligible=False, reason="stake_check_failed")
+
+        if stake < self.min_stake_threshold:
+            return EligibilityResult(
+                eligible=False,
+                reason=f"stake_too_low:{stake:.0f}<{self.min_stake_threshold}",
+            )
+
+        return EligibilityResult(eligible=True)
+
+    # -- Challenge-response --
+
+    def issue_challenge(self, hotkey: str) -> str:
+        """Generate a random nonce for a hotkey to sign."""
+        # Clean expired challenges
+        self._challenges = {
+            k: v for k, v in self._challenges.items() if not v.expired
+        }
+
+        nonce = secrets.token_hex(32)
+        self._challenges[nonce] = _PendingChallenge(
+            nonce=nonce,
+            hotkey=hotkey,
+            created_at=time.time(),
+        )
+        return nonce
+
+    def verify_response(
+        self, hotkey: str, nonce: str, signature: str,
+    ) -> str | None:
+        """Verify a signed challenge and issue a bearer token.
+
+        Returns:
+            Bearer token string on success, None on failure.
+        """
+        # Look up challenge
+        challenge = self._challenges.pop(nonce, None)
+        if challenge is None:
+            return None
+        if challenge.expired:
+            return None
+        if challenge.hotkey != hotkey:
+            return None
+
+        # Verify signature
+        try:
+            sig_bytes = bytes.fromhex(signature)
+            keypair = bt.Keypair(ss58_address=hotkey)
+            if not keypair.verify(nonce.encode(), sig_bytes):
+                return None
+        except Exception:
+            return None
+
+        # Issue token
+        token = secrets.token_hex(32)
+        entry = _TokenEntry(hotkey=hotkey, created_at=time.time(), ttl=self.token_ttl)
+
+        # LRU eviction
+        while len(self._tokens) >= self.max_tokens:
+            self._tokens.popitem(last=False)
+
+        self._tokens[token] = entry
+        return token
+
+    def validate_token(self, token: str) -> str | None:
+        """Validate a bearer token. Returns the hotkey or None."""
+        entry = self._tokens.get(token)
+        if entry is None:
+            return None
+        if entry.expired:
+            self._tokens.pop(token, None)
+            return None
+        # Move to end (LRU touch)
+        self._tokens.move_to_end(token)
+        return entry.hotkey
+
+    # -- Rate limiting --
+
+    def check_rate_limit(self, hotkey: str) -> bool:
+        """Check if a hotkey is within rate limits. Returns True if allowed."""
+        now = time.time()
+        window = 3600.0  # 1 hour
+
+        log = self._request_log.get(hotkey, [])
+        # Prune old entries
+        log = [t for t in log if now - t < window]
+        log.append(now)
+        self._request_log[hotkey] = log
+
+        return len(log) <= self.rate_limit_per_hour
+
+
+__all__ = ["AccessPolicy", "EligibilityResult"]

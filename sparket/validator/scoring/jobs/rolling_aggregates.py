@@ -74,11 +74,15 @@ _UPSERT_ROLLING_SCORE = text(
     INSERT INTO miner_rolling_score (
         miner_id, miner_hotkey, as_of, window_days,
         n_submissions, n_eff, es_mean, es_std, es_adj, mes_mean,
-        pss_mean, fq_raw, brier_mean, score_version
+        pss_mean, fq_raw, brier_mean, score_version,
+        brier_ws, brier_wt, fq_ws, fq_wt, pss_ws, pss_wt,
+        es_ws, es_wt, mes_ws, mes_wt, sos_ws, sos_wt, lead_ws, lead_wt
     ) VALUES (
         :miner_id, :miner_hotkey, :as_of, :window_days,
         :n_submissions, :n_eff, :es_mean, :es_std, :es_adj, :mes_mean,
-        :pss_mean, :fq_raw, :brier_mean, :score_version
+        :pss_mean, :fq_raw, :brier_mean, :score_version,
+        :brier_ws, :brier_wt, :fq_ws, :fq_wt, :pss_ws, :pss_wt,
+        :es_ws, :es_wt, :mes_ws, :mes_wt, :sos_ws, :sos_wt, :lead_ws, :lead_wt
     )
     ON CONFLICT (miner_id, miner_hotkey, as_of, window_days) DO UPDATE SET
         n_submissions = EXCLUDED.n_submissions,
@@ -90,7 +94,21 @@ _UPSERT_ROLLING_SCORE = text(
         pss_mean = EXCLUDED.pss_mean,
         fq_raw = EXCLUDED.fq_raw,
         brier_mean = EXCLUDED.brier_mean,
-        score_version = EXCLUDED.score_version
+        score_version = EXCLUDED.score_version,
+        brier_ws = EXCLUDED.brier_ws,
+        brier_wt = EXCLUDED.brier_wt,
+        fq_ws = EXCLUDED.fq_ws,
+        fq_wt = EXCLUDED.fq_wt,
+        pss_ws = EXCLUDED.pss_ws,
+        pss_wt = EXCLUDED.pss_wt,
+        es_ws = EXCLUDED.es_ws,
+        es_wt = EXCLUDED.es_wt,
+        mes_ws = EXCLUDED.mes_ws,
+        mes_wt = EXCLUDED.mes_wt,
+        sos_ws = EXCLUDED.sos_ws,
+        sos_wt = EXCLUDED.sos_wt,
+        lead_ws = EXCLUDED.lead_ws,
+        lead_wt = EXCLUDED.lead_wt
     """
 )
 
@@ -334,6 +352,18 @@ class RollingAggregatesJob(ScoringJob):
         # FQ = 1 - 2*brier (transforms 0=perfect, 0.5=random to 1=perfect, 0=random)
         fq_raw = 1.0 - 2.0 * brier_mean
 
+        # Compute accumulator pairs for ledger export
+        brier_ws = float(np.sum(np.array(brier_values) * np.array(brier_weights))) if brier_values else 0.0
+        brier_wt = float(np.sum(brier_weights)) if brier_weights else 0.0
+        fq_ws = float(np.sum((1.0 - 2.0 * np.array(brier_values)) * np.array(brier_weights))) if brier_values else 0.0
+        fq_wt = brier_wt
+        pss_ws = float(np.sum(np.array(pss_values) * np.array(pss_weights))) if pss_values else 0.0
+        pss_wt = float(np.sum(pss_weights)) if pss_weights else 0.0
+        es_ws = float(np.sum(np.array(cle_values) * np.array(cle_weights))) if cle_values else 0.0
+        es_wt = float(np.sum(cle_weights)) if cle_weights else 0.0
+        mes_ws = float(np.sum(mes_arr * clv_w_arr)) if clv_prob_values else 0.0
+        mes_wt = float(np.sum(clv_prob_weights)) if clv_prob_values else 0.0
+
         return {
             "n_submissions": len(submissions),
             "n_eff": n_eff,
@@ -344,6 +374,17 @@ class RollingAggregatesJob(ScoringJob):
             "pss_mean": pss_mean,
             "brier_mean": brier_mean,
             "fq_raw": fq_raw,
+            # Accumulator pairs for ledger checkpoint export
+            "brier_ws": brier_ws,
+            "brier_wt": brier_wt,
+            "fq_ws": fq_ws,
+            "fq_wt": fq_wt,
+            "pss_ws": pss_ws,
+            "pss_wt": pss_wt,
+            "es_ws": es_ws,
+            "es_wt": es_wt,
+            "mes_ws": mes_ws,
+            "mes_wt": mes_wt,
         }
 
     def _apply_shrinkage(
@@ -387,7 +428,7 @@ class RollingAggregatesJob(ScoringJob):
         as_of: datetime,
         window_days: int,
     ) -> None:
-        """Persist rolling scores to database."""
+        """Persist rolling scores to database (including accumulator pairs for ledger)."""
         for metrics in miner_metrics.values():
             await self.db.write(
                 _UPSERT_ROLLING_SCORE,
@@ -406,6 +447,22 @@ class RollingAggregatesJob(ScoringJob):
                     "fq_raw": float(metrics["fq_raw"]),
                     "brier_mean": float(metrics["brier_mean"]),
                     "score_version": 2,
+                    # Accumulator pairs for ledger checkpoint export
+                    "brier_ws": metrics.get("brier_ws", 0.0),
+                    "brier_wt": metrics.get("brier_wt", 0.0),
+                    "fq_ws": metrics.get("fq_ws", 0.0),
+                    "fq_wt": metrics.get("fq_wt", 0.0),
+                    "pss_ws": metrics.get("pss_ws", 0.0),
+                    "pss_wt": metrics.get("pss_wt", 0.0),
+                    "es_ws": metrics.get("es_ws", 0.0),
+                    "es_wt": metrics.get("es_wt", 0.0),
+                    "mes_ws": metrics.get("mes_ws", 0.0),
+                    "mes_wt": metrics.get("mes_wt", 0.0),
+                    # SOS and lead are computed by OriginalityLeadLagJob, not here
+                    "sos_ws": None,
+                    "sos_wt": None,
+                    "lead_ws": None,
+                    "lead_wt": None,
                 },
             )
 

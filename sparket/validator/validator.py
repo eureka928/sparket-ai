@@ -199,6 +199,15 @@ class BaseValidatorNeuron(BaseNeuron):
         except Exception as e:
             bt.logging.warning({"validator_context": {"sdio_ingestor_close_error": str(e)}})
 
+        # Stop ledger HTTP server
+        try:
+            ledger_server = getattr(self, "_ledger_http_server", None)
+            loop = getattr(self, "loop", None)
+            if ledger_server is not None and loop and not loop.is_closed():
+                loop.run_until_complete(ledger_server.stop())
+        except Exception as e:
+            bt.logging.warning({"validator_context": {"ledger_http_stop_error": str(e)}})
+
         try:
             self.save_state()
         except Exception as e:
@@ -386,6 +395,47 @@ class BaseValidatorNeuron(BaseNeuron):
                     bt.logging.warning({"scoring_worker": "failed_to_start", "error": str(e)})
             else:
                 bt.logging.info({"scoring_worker": "disabled"})
+
+            # Start ledger HTTP server if enabled (for auditor validators)
+            self._ledger_http_server = None
+            try:
+                ledger_enabled = bool(os.environ.get("SPARKET_LEDGER__ENABLED", "").lower() in ("true", "1", "yes"))
+                if ledger_enabled:
+                    bt.logging.info({"validator_init": {"step": "starting_ledger_http_server"}})
+                    from sparket.validator.ledger.store.filesystem import FilesystemStore
+                    from sparket.validator.ledger.store.http_server import LedgerHTTPServer
+                    from sparket.validator.ledger.auth import AccessPolicy
+                    from sparket.validator.ledger.exporter import LedgerExporter
+
+                    ledger_data_dir = os.environ.get("SPARKET_LEDGER__DATA_DIR", "sparket/data/ledger")
+                    ledger_port = int(os.environ.get("SPARKET_LEDGER__HTTP_PORT", "8200"))
+                    min_stake = int(os.environ.get("SPARKET_LEDGER__MIN_STAKE_THRESHOLD", "100000"))
+
+                    ledger_store = FilesystemStore(data_dir=ledger_data_dir)
+                    ledger_policy = AccessPolicy(
+                        metagraph=self.metagraph,
+                        min_stake_threshold=min_stake,
+                    )
+                    ledger_exporter = LedgerExporter(
+                        database=self.dbm,
+                        wallet=self.wallet,
+                        netuid=self.config.netuid,
+                    )
+
+                    self._ledger_http_server = LedgerHTTPServer(
+                        store=ledger_store,
+                        access_policy=ledger_policy,
+                        exporter=ledger_exporter,
+                        host="0.0.0.0",
+                        port=ledger_port,
+                    )
+                    self.loop.run_until_complete(self._ledger_http_server.start())
+                    bt.logging.info({"validator_init": {"step": "ledger_http_server_started", "port": ledger_port}})
+                else:
+                    bt.logging.info({"validator_init": {"step": "ledger_http_server_disabled"}})
+            except Exception as e:
+                bt.logging.warning({"validator_init": {"ledger_http_error": str(e)}})
+                self._ledger_http_server = None
 
             # Summarize bittensor state for visibility
             try:

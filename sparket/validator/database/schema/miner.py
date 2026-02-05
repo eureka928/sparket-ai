@@ -366,6 +366,21 @@ class MinerRollingScore(Base):
         Numeric,
         comment="Legacy composite (deprecated, use skill_score)",
     )
+    # Accumulator pairs for ledger export (ws = weighted_sum, wt = weight_sum)
+    brier_ws: Mapped[float | None] = mapped_column(Numeric, comment="Weighted sum for Brier scores")
+    brier_wt: Mapped[float | None] = mapped_column(Numeric, comment="Weight sum for Brier scores")
+    fq_ws: Mapped[float | None] = mapped_column(Numeric, comment="Weighted sum for FQ")
+    fq_wt: Mapped[float | None] = mapped_column(Numeric, comment="Weight sum for FQ")
+    pss_ws: Mapped[float | None] = mapped_column(Numeric, comment="Weighted sum for PSS")
+    pss_wt: Mapped[float | None] = mapped_column(Numeric, comment="Weight sum for PSS")
+    es_ws: Mapped[float | None] = mapped_column(Numeric, comment="Weighted sum for CLE")
+    es_wt: Mapped[float | None] = mapped_column(Numeric, comment="Weight sum for CLE")
+    mes_ws: Mapped[float | None] = mapped_column(Numeric, comment="Weighted sum for MES")
+    mes_wt: Mapped[float | None] = mapped_column(Numeric, comment="Weight sum for MES")
+    sos_ws: Mapped[float | None] = mapped_column(Numeric, comment="Weighted sum for SOS")
+    sos_wt: Mapped[float | None] = mapped_column(Numeric, comment="Weight sum for SOS")
+    lead_ws: Mapped[float | None] = mapped_column(Numeric, comment="Weighted sum for lead ratio")
+    lead_wt: Mapped[float | None] = mapped_column(Numeric, comment="Weight sum for lead ratio")
     # Versioning for consensus
     score_version: Mapped[int] = mapped_column(
         Integer,

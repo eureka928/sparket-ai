@@ -34,6 +34,9 @@ from ..aggregation.normalization import normalize_zscore_logistic, normalize_per
 from ..determinism import get_canonical_window_bounds
 from .base import ScoringJob
 
+from sparket.validator.ledger.models import MinerMetrics, ScoringConfigSnapshot, ChainParamsSnapshot
+from sparket.validator.ledger.compute_weights import compute_weights as _shared_compute_weights
+
 
 # SQL queries
 _SELECT_ROLLING_SCORES = text(
@@ -130,17 +133,10 @@ class SkillScoreJob(ScoringJob):
         if not rows:
             return
 
-        # Collect raw metrics by miner
+        # Build MinerMetrics from DB rows (same conversion auditors do from checkpoints)
         keys: List[MinerKey] = []
         miner_info: Dict[MinerKey, Dict[str, Any]] = {}
-
-        fq_raw_list = []
-        pss_list = []
-        cal_list = []
-        es_adj_list = []
-        mes_list = []
-        sos_list = []
-        lead_list = []
+        metrics_list: List[MinerMetrics] = []
 
         for row in rows:
             key = make_miner_key(row["miner_id"], row["miner_hotkey"])
@@ -149,89 +145,72 @@ class SkillScoreJob(ScoringJob):
                 "miner_id": row["miner_id"],
                 "miner_hotkey": row["miner_hotkey"],
             }
+            metrics_list.append(MinerMetrics(
+                uid=0,  # UID not needed for normalization, only for weight indexing
+                hotkey=row["miner_hotkey"],
+                fq_raw=self._to_float_safe(row["fq_raw"], 0.0),
+                pss_mean=self._to_float_safe(row["pss_mean"], 0.0),
+                es_adj=self._to_float_safe(row["es_adj"], 0.0),
+                mes_mean=self._to_float_safe(row["mes_mean"], 0.5),
+                cal_score=self._to_float_safe(row["cal_score"], 0.5),
+                sharp_score=self._to_float_safe(row.get("sharp_score"), 0.5),
+                sos_score=self._to_float_safe(row["sos_score"], 0.5),
+                lead_score=self._to_float_safe(row["lead_score"], 0.5),
+                brier_mean=self._to_float_safe(row.get("brier_mean"), 0.0),
+            ))
 
-            # FQ = 1 - 2*brier (already computed in rolling_aggregates)
-            fq_raw_list.append(self._to_float_safe(row["fq_raw"], 0.0))
-            # PSS (time-adjusted from rolling_aggregates)
-            pss_list.append(self._to_float_safe(row["pss_mean"], 0.0))
-            # Calibration
-            cal_list.append(self._to_float_safe(row["cal_score"], 0.5))
-            # Economic edge
-            es_adj_list.append(self._to_float_safe(row["es_adj"], 0.0))
-            mes_list.append(self._to_float_safe(row["mes_mean"], 0.5))
-            # Information value
-            sos_list.append(self._to_float_safe(row["sos_score"], 0.5))
-            lead_list.append(self._to_float_safe(row["lead_score"], 0.5))
+        # Use shared normalization logic (same code path as auditors)
+        scoring_config = ScoringConfigSnapshot(params=self.params.model_dump(mode="json"))
+        # We only need normalization + dimension scores here, not full weight computation.
+        # Use the shared normalization arrays directly:
+        sorted_metrics = sorted(metrics_list, key=lambda m: m.hotkey)
 
-        # Convert to arrays
-        fq_raw = np.array(fq_raw_list)
-        pss = np.array(pss_list)
-        cal = np.array(cal_list)
-        es_adj = np.array(es_adj_list)
-        mes = np.array(mes_list)
-        sos = np.array(sos_list)
-        lead = np.array(lead_list)
+        fq_raw = np.array([m.fq_raw for m in sorted_metrics], dtype=np.float64)
+        pss = np.array([m.pss_mean for m in sorted_metrics], dtype=np.float64)
+        cal = np.array([m.cal_score for m in sorted_metrics], dtype=np.float64)
+        es_adj = np.array([m.es_adj for m in sorted_metrics], dtype=np.float64)
+        mes = np.array([m.mes_mean for m in sorted_metrics], dtype=np.float64)
+        sos = np.array([m.sos_score for m in sorted_metrics], dtype=np.float64)
+        lead = np.array([m.lead_score for m in sorted_metrics], dtype=np.float64)
 
-        # Normalize metrics that need normalization
-        # FQ is already [-1, 1] from 1 - 2*brier, normalize to [0, 1]
-        fq_norm = (fq_raw + 1) / 2  # Linear map from [-1,1] to [0,1]
-        fq_norm = np.clip(fq_norm, 0, 1)
-        
-        # PSS can be negative (worse than baseline), normalize
+        n_miners = len(sorted_metrics)
         min_count = int(self.params.normalization.min_count_for_zscore)
-        use_zscore = len(rows) >= min_count
+
+        # Normalization (shared logic with compute_weights)
+        fq_norm = np.clip((fq_raw + 1) / 2, 0, 1)
+        use_zscore = n_miners >= min_count
         if use_zscore:
             pss_norm = normalize_zscore_logistic(pss)
             es_norm = normalize_zscore_logistic(es_adj)
         else:
             pss_norm = normalize_percentile(pss)
             es_norm = normalize_percentile(es_adj)
-
-        # Others are already in [0, 1] range
         cal_norm = np.clip(cal, 0, 1)
         mes_norm = np.clip(mes, 0, 1)
         sos_norm = np.clip(sos, 0, 1)
         lead_norm = np.clip(lead, 0, 1)
 
-        # Get dimension weights
+        # Dimension combining
         dim_weights = self.params.dimension_weights
         skill_weights = self.params.skill_score_weights
 
-        # ForecastDim = w_fq * FQ + w_cal * CAL (accuracy-based)
-        w_fq = float(dim_weights.w_fq)
-        w_cal = float(dim_weights.w_cal)
-        forecast_dim = w_fq * fq_norm + w_cal * cal_norm
-
-        # SkillDim = PSS (relative skill vs market, time-adjusted)
-        # This is a single metric dimension
+        forecast_dim = float(dim_weights.w_fq) * fq_norm + float(dim_weights.w_cal) * cal_norm
         skill_dim = pss_norm
+        econ_dim = float(dim_weights.w_edge) * es_norm + float(dim_weights.w_mes) * mes_norm
+        info_dim = float(dim_weights.w_sos) * sos_norm + float(dim_weights.w_lead) * lead_norm
 
-        # EconDim = w_edge * EDGE + w_mes * MES
-        w_edge = float(dim_weights.w_edge)
-        w_mes = float(dim_weights.w_mes)
-        econ_dim = w_edge * es_norm + w_mes * mes_norm
-
-        # InfoDim = w_sos * SOS + w_lead * LEAD
-        w_sos = float(dim_weights.w_sos)
-        w_lead = float(dim_weights.w_lead)
-        info_dim = w_sos * sos_norm + w_lead * lead_norm
-
-        # SkillScore = weighted combination of all dimensions (task-mapped)
-        w_outcome_accuracy = float(skill_weights.w_outcome_accuracy)
-        w_outcome_relative = float(skill_weights.w_outcome_relative)
-        w_odds_edge = float(skill_weights.w_odds_edge)
-        w_info_adv = float(skill_weights.w_info_adv)
-        
         skill_score = (
-            w_outcome_accuracy * forecast_dim +
-            w_outcome_relative * skill_dim +
-            w_odds_edge * econ_dim +
-            w_info_adv * info_dim
+            float(skill_weights.w_outcome_accuracy) * forecast_dim
+            + float(skill_weights.w_outcome_relative) * skill_dim
+            + float(skill_weights.w_odds_edge) * econ_dim
+            + float(skill_weights.w_info_adv) * info_dim
         )
 
-        # Persist results
-        for i, key in enumerate(keys):
+        # Persist results - map back from sorted order to original key order
+        hotkey_to_idx = {m.hotkey: i for i, m in enumerate(sorted_metrics)}
+        for key_idx, key in enumerate(keys):
             info = miner_info[key]
+            i = hotkey_to_idx[info["miner_hotkey"]]
             await self.db.write(
                 _UPDATE_SKILL_SCORE,
                 params={

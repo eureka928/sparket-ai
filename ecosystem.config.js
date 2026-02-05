@@ -134,18 +134,46 @@ module.exports = {
       vizion: true,
     },
     
-    // Add more app configurations here if needed (e.g., miner, API server)
-    // {
-    //   name: 'miner-local',
-    //   script: 'sparket/entrypoints/miner.py',
-    //   interpreter: '/root/sparket-subnet/.venv/bin/python',
-    //   cwd: '/root/sparket-subnet',
-    //   env: {
-    //     ...envVars,
-    //     SPARKET_ROLE: 'miner',
-    //   },
-    //   // ... similar configuration
-    // },
+    // Auditor validator - disabled by default.
+    // Enable by: pm2 start ecosystem.config.js --only auditor-local
+    // Requires: SPARKET_AUDITOR__PRIMARY_HOTKEY and SPARKET_AUDITOR__PRIMARY_URL in .env
+    {
+      name: 'auditor-local',
+      script: path.join(projectRoot, 'sparket/entrypoints/auditor.py'),
+      interpreter,
+      cwd: projectRoot,
+      instances: 1,
+      exec_mode: 'fork',
+      
+      env: {
+        NODE_ENV: 'production',
+        PYTHONUNBUFFERED: '1',
+        SPARKET_ROLE: 'auditor',
+        PROJECT_ROOT: projectRoot,
+        PM2_LOG_DIR: logDir,
+        VENV_PYTHON: interpreter,
+        ...envVars,
+      },
+      
+      autorestart: true,
+      watch: false,
+      max_memory_restart: '512M',
+      
+      min_uptime: '10s',
+      max_restarts: 10,
+      restart_delay: 4000,
+      
+      error_file: path.join(logDir, 'auditor-local-error.log'),
+      out_file: path.join(logDir, 'auditor-local-out.log'),
+      log_file: path.join(logDir, 'auditor-local-combined.log'),
+      time: true,
+      log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
+      merge_logs: true,
+      
+      kill_timeout: 5000,
+      wait_ready: false,
+      listen_timeout: 10000,
+    },
   ],
   
   // Deployment configuration (optional)
