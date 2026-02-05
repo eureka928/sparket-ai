@@ -388,10 +388,10 @@ class OddsAPIFetcher:
             consensus_home = 0.5
             consensus_away = 0.5
 
-        # Convert back to odds (with standard vig)
-        vig = 0.045
-        home_odds_final = round(1 / (consensus_home + vig / 2), 2)
-        away_odds_final = round(1 / (consensus_away + vig / 2), 2)
+        # Store raw probabilities - odds will be computed when needed with caller's vig
+        # Using 0 vig here since these odds aren't used for submission
+        home_odds_final = round(1 / max(0.001, consensus_home), 2)
+        away_odds_final = round(1 / max(0.001, consensus_away), 2)
 
         return MarketOdds(
             event_id=event.get("id", ""),
@@ -423,7 +423,7 @@ class OddsAPIFetcher:
             sport: Sport code
             home_team: Home team code
             away_team: Away team code
-            vig: Vigorish to apply
+            vig: Vigorish to apply to the odds
 
         Returns:
             OddsPrices or None if not found
@@ -433,11 +433,20 @@ class OddsAPIFetcher:
         if market is None:
             return None
 
+        # Apply vig to compute odds from probabilities
+        implied_home = market.home_prob + vig / 2
+        implied_away = market.away_prob + vig / 2
+        implied_home = max(0.001, min(0.999, implied_home))
+        implied_away = max(0.001, min(0.999, implied_away))
+
+        home_odds = max(1.01, min(1000.0, 1 / implied_home))
+        away_odds = max(1.01, min(1000.0, 1 / implied_away))
+
         return OddsPrices(
             home_prob=market.home_prob,
             away_prob=market.away_prob,
-            home_odds_eu=market.home_odds,
-            away_odds_eu=market.away_odds,
+            home_odds_eu=round(home_odds, 2),
+            away_odds_eu=round(away_odds, 2),
         )
 
     async def get_all_games(self, sport: str) -> List[MarketOdds]:

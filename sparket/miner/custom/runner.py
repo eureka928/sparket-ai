@@ -31,6 +31,7 @@ from sparket.miner.custom.models.calibration.isotonic import IsotonicCalibrator
 from sparket.miner.custom.models.engines.elo import EloEngine
 from sparket.miner.custom.models.engines.ensemble import EnsembleEngine
 from sparket.miner.custom.models.engines.poisson import PoissonEngine
+from sparket.miner.custom.strategy.econ_tracker import EconTracker
 from sparket.miner.custom.strategy.originality import OriginalityTracker
 from sparket.miner.custom.strategy.timing import (
     SubmissionDecision,
@@ -122,6 +123,11 @@ class CustomMiner:
         self._originality = OriginalityTracker(
             data_path=str(self._data_dir / "originality.json"),
             max_history_days=30.0,
+        )
+
+        # Economic performance tracking for EconDim feedback
+        self._econ_tracker = EconTracker(
+            data_path=str(self._data_dir / "econ_tracker.json"),
         )
 
         # Ensemble engine combining all models
@@ -299,6 +305,25 @@ class CustomMiner:
         cal_home = ensemble_pred.home_prob
         cal_away = ensemble_pred.away_prob
 
+        # 2a. Variance-aware shrinkage toward market (improves EconDim ES)
+        # When confidence is low, shrink toward market to reduce CLE variance.
+        # ES = CLE_mean / CLE_std, so lower variance improves Sharpe ratio.
+        shrinkage_applied = 0.0
+        if market_odds is not None and ensemble_pred.confidence < 0.8:
+            # Shrinkage factor: more shrinkage when confidence is lower
+            # At confidence=0.5, shrink 30% toward market
+            # At confidence=0.8, shrink 0% (no shrinkage)
+            shrink_factor = 0.3 * (0.8 - ensemble_pred.confidence) / 0.3
+            shrink_factor = max(0.0, min(0.5, shrink_factor))  # Cap at 50%
+
+            # Only shrink if we differ significantly from market (>3%)
+            diff_from_market = abs(cal_home - market_odds.home_prob)
+            if diff_from_market > 0.03:
+                old_home = cal_home
+                cal_home = cal_home * (1 - shrink_factor) + market_odds.home_prob * shrink_factor
+                cal_away = 1.0 - cal_home
+                shrinkage_applied = shrink_factor
+
         # 2b. Apply originality adjustment for InfoDim SOS
         diff_decision = None
         market_consensus_prob = None
@@ -364,6 +389,7 @@ class CustomMiner:
             "ensemble_confidence": round(ensemble_pred.confidence, 3),
             "dominant_source": ensemble_pred.dominant_source,
             "models_agreed": ensemble_pred.models_agreed,
+            "variance_shrinkage": round(shrinkage_applied, 3) if shrinkage_applied > 0 else None,
             "calibration_applied": self._calibrator.is_fitted,
             "originality_adj": round(diff_decision.suggested_adjustment, 4) if diff_decision is not None else None,
             "originality_reason": diff_decision.reason if diff_decision is not None else None,
@@ -997,6 +1023,16 @@ class CustomMiner:
                     cle = max(-1.0, min(1.0, cle))
                     # CLV_prob = (truth_prob - miner_prob) / truth_prob
                     clv_prob = (closing_home_prob - submitted_prob) / closing_home_prob if closing_home_prob > 0 else 0.0
+                    # Record to econ tracker for rolling stats
+                    self._econ_tracker.record(
+                        market_id=int(market_id),
+                        cle=cle,
+                        clv_prob=clv_prob,
+                    )
+
+                    # Get rolling stats for logging
+                    econ_stats = self._econ_tracker.get_stats()
+
                     bt.logging.info({
                         "custom_miner": "clv_observation",
                         "event_id": event_id,
@@ -1007,6 +1043,9 @@ class CustomMiner:
                         "closing_odds": round(closing_odds, 2),
                         "cle": round(cle, 4),
                         "clv_prob": round(clv_prob, 4),
+                        "rolling_cle_mean": round(econ_stats["cle_mean"], 4),
+                        "rolling_es_sharpe": round(econ_stats["es_sharpe"], 3),
+                        "econ_samples": econ_stats["n_samples"],
                     })
 
             # Clean up stored prediction and mark outcome as processed
@@ -1060,6 +1099,7 @@ class CustomMiner:
 
     def get_diagnostics(self) -> Dict[str, Any]:
         """Get miner diagnostics and stats."""
+        econ_stats = self._econ_tracker.get_stats()
         return {
             "running": self._running,
             "submissions_count": self._submissions_count,
@@ -1068,6 +1108,13 @@ class CustomMiner:
             "line_history": self._line_history.stats(),
             "recent_steam_moves": len(self._line_history.get_recent_steam_moves(24.0)),
             "originality": self._originality.stats(),
+            "econ_dim": {
+                "cle_mean": round(econ_stats["cle_mean"], 4),
+                "cle_std": round(econ_stats["cle_std"], 4),
+                "es_sharpe": round(econ_stats["es_sharpe"], 3),
+                "mes_mean": round(econ_stats["mes_mean"], 3),
+                "samples": econ_stats["n_samples"],
+            },
             "ensemble": self._ensemble.get_model_stats(),
             "odds_api": {
                 "enabled": self._odds_api is not None,
