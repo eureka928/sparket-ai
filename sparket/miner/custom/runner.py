@@ -730,11 +730,13 @@ class CustomMiner:
 
         # Cap _processed_outcomes to prevent unbounded growth (keep last 10k)
         if len(self._processed_outcomes) > 10000:
-            # Can't easily age a set, just trim to recent half
-            excess = len(self._processed_outcomes) - 5000
-            it = iter(self._processed_outcomes)
-            for _ in range(excess):
-                self._processed_outcomes.discard(next(it))
+            # Keep only outcomes that still have active predictions
+            active_ids = set(self._submitted_predictions.keys())
+            self._processed_outcomes &= active_ids
+            # If still too large after intersection, keep a bounded size
+            if len(self._processed_outcomes) > 5000:
+                sorted_ids = sorted(self._processed_outcomes)
+                self._processed_outcomes = set(sorted_ids[-5000:])
 
         removed = len(stale_keys) + len(orphaned)
         if removed:
@@ -874,7 +876,9 @@ class CustomMiner:
             from sparket.miner.database.repository import get_past_events
 
             if hasattr(self.game_sync, 'database') and self.game_sync.database is not None:
-                db_events = await get_past_events(self.game_sync.database)
+                db_events = await asyncio.wait_for(
+                    get_past_events(self.game_sync.database), timeout=10.0,
+                )
                 if db_events:
                     return db_events
         except ImportError:
@@ -1020,7 +1024,7 @@ class CustomMiner:
                     closing_odds = 1.0 / max(0.001, closing_home_prob)
                     # CLE = miner_odds * truth_prob - 1.0
                     cle = submitted_odds * closing_home_prob - 1.0
-                    cle = max(-1.0, min(1.0, cle))
+                    cle = max(-1.0, min(10.0, cle))
                     # CLV_prob = (truth_prob - miner_prob) / truth_prob
                     clv_prob = (closing_home_prob - submitted_prob) / closing_home_prob if closing_home_prob > 0 else 0.0
                     # Record to econ tracker for rolling stats

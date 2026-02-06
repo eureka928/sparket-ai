@@ -192,35 +192,32 @@ class TimingStrategy:
             return self.config.refresh_interval_seconds
 
     def _calculate_time_credit(self, hours_until: float) -> float:
-        """Calculate expected time credit based on hours until event.
+        """Calculate expected time credit matching validator's logarithmic formula.
 
-        Time credit follows a decay curve:
-        - 7+ days (168h): 100%
-        - 1 day (24h): ~60%
-        - 12h: ~40%
-        - 2h: ~15%
-        - 1h: 10% (floor)
+        Validator uses: normalized = (log(minutes) - log(min)) / (log(max) - log(min))
+        with min=60min, max=early_submission_days*24*60, floor=0.1
         """
+        import math
+
         if hours_until <= 0:
             return 0.0
 
-        # Full credit threshold (7 days)
-        full_credit_hours = self.config.early_submission_days * 24
+        minutes = hours_until * 60.0
+        min_minutes = 60.0  # 1 hour floor
+        max_minutes = self.config.early_submission_days * 24 * 60  # 7 days default
+        floor_factor = 0.1
 
-        if hours_until >= full_credit_hours:
+        if minutes >= max_minutes:
             return 1.0
+        if minutes <= min_minutes:
+            return floor_factor
 
-        # Floor at 1 hour
-        if hours_until <= 1:
-            return 0.1
+        log_min = math.log(min_minutes)
+        log_max = math.log(max_minutes)
+        log_val = math.log(minutes)
+        normalized = (log_val - log_min) / (log_max - log_min)
 
-        # Linear interpolation between floor and full credit
-        # Using a slightly concave curve to reward earlier submissions
-        ratio = hours_until / full_credit_hours
-        # Curve: credit = 0.1 + 0.9 * ratio^0.7
-        credit = 0.1 + 0.9 * (ratio ** 0.7)
-
-        return min(1.0, max(0.1, credit))
+        return floor_factor + normalized * (1.0 - floor_factor)
 
     def _calculate_priority(self, hours_until: float, time_credit: float) -> int:
         """Calculate submission priority (0-100).

@@ -110,10 +110,6 @@ class IsotonicCalibrator:
         )
         self._samples.append(sample)
 
-        # Invalidate fit when new data arrives
-        if self._fitted:
-            self._fitted = False
-
     def fit(self) -> bool:
         """Fit the isotonic regression model.
 

@@ -43,7 +43,7 @@ class TestTimingStrategy:
         assert decision.time_credit == 1.0
 
     def test_reduced_credit_for_late_submission(self):
-        """Same-day submissions should get reduced credit."""
+        """Same-day submissions should get reduced credit (log curve)."""
         strategy = TimingStrategy()
         now = datetime.now(timezone.utc)
         event_start = now + timedelta(hours=12)
@@ -54,7 +54,9 @@ class TestTimingStrategy:
             now=now,
         )
 
-        assert decision.time_credit < 0.5
+        # Log curve gives ~0.54 at 12h (between floor 0.1 and full 1.0)
+        assert decision.time_credit < 0.7
+        assert decision.time_credit > 0.1
 
     def test_skip_when_too_late(self):
         """Should skip when past cutoff."""

@@ -71,11 +71,11 @@ class TimingConfig:
     # Refresh interval (6 hours = 4x/day)
     refresh_interval_seconds: int = 6 * 3600
 
-    # Minimum time before event (2 hours floor)
-    min_hours_before_event: float = 2.0
+    # Minimum time before event (1 hour matches validator min_minutes=60)
+    min_hours_before_event: float = 1.0
 
     # Don't submit if less than this many hours before
-    cutoff_hours: float = 0.5
+    cutoff_hours: float = 0.25
 
     # Minimum refresh interval for adaptive timing (seconds)
     min_refresh_seconds: int = 300
@@ -139,11 +139,11 @@ class CustomMinerConfig:
     # Standard vig to apply (4.5% default)
     vig: float = 0.045
 
-    # Engine weights for ensemble (Phase 3)
+    # Engine weights for ensemble — market-heavy for EconDim optimization
     engine_weights: Dict[str, float] = field(default_factory=lambda: {
-        "elo": 0.50,      # Elo-based predictions
-        "market": 0.35,   # Market consensus
-        "poisson": 0.15,  # Poisson model (for totals)
+        "elo": 0.35,      # Elo-based predictions
+        "market": 0.55,   # Market consensus (dominant for CLV/CLE)
+        "poisson": 0.10,  # Poisson model (for totals)
     })
 
     # Rate limiting
