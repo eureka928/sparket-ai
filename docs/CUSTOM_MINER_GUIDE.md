@@ -115,14 +115,14 @@ Note: Option C does NOT serve an axon, so validators cannot reach this miner on 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SPARKET_CUSTOM_MINER__CALIBRATION__ENABLED` | `true` | Enable isotonic calibration |
-| `SPARKET_CUSTOM_MINER__CALIBRATION__MIN_SAMPLES` | `30` | Samples before calibration activates |
+| `SPARKET_CUSTOM_MINER__CALIBRATION__MIN_SAMPLES` | `100` | Samples before calibration activates |
 
 ### Rate Limiting
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SPARKET_CUSTOM_MINER__RATE_LIMIT_PER_MINUTE` | `10` | Global submissions per minute |
-| `SPARKET_CUSTOM_MINER__PER_MARKET_LIMIT_PER_MINUTE` | `2` | Per-market submissions per minute |
+| `SPARKET_CUSTOM_MINER__RATE_LIMIT_PER_MINUTE` | `60` | Global submissions per minute |
+| `SPARKET_CUSTOM_MINER__PER_MARKET_LIMIT_PER_MINUTE` | `10` | Per-market submissions per minute |
 
 ## Testing
 
@@ -246,7 +246,7 @@ The custom miner's originality tracker helps optimize these by:
 
 Submit predictions **early** for maximum time credit:
 - 7+ days before event = 100% time credit
-- Decreases linearly as event approaches
+- Decreases logarithmically as event approaches
 - Set `EARLY_SUBMISSION_DAYS=7` for optimal timing
 
 ## Data Storage

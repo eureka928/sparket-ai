@@ -24,7 +24,7 @@ Understanding the scoring system is critical for optimization:
 | Submission Timing | Credit |
 |-------------------|--------|
 | 7+ days before event | 100% |
-| 1 day before | ~50% |
+| 1 day before | ~66% |
 | 1 hour before | 10% (floor) |
 | After event starts | 0% |
 
@@ -181,7 +181,7 @@ Pool Adjacent Violators (PAV) algorithm for probability calibration:
 ```python
 from sparket.miner.custom.models.calibration.isotonic import IsotonicCalibrator
 
-calibrator = IsotonicCalibrator(min_samples=30)
+calibrator = IsotonicCalibrator(min_samples=100)
 calibrator.add_sample(predicted=0.65, actual=1.0)
 # After enough samples:
 calibrated_home, calibrated_away = calibrator.calibrate_pair(0.65, 0.35)
@@ -193,7 +193,7 @@ Optimizes submission timing for maximum time credit:
 
 - Submit 7+ days early for 100% credit
 - Refresh every 6 hours with updated predictions
-- Never submit within 2 hours of event (10% credit penalty zone)
+- Never submit within 1 hour of event (10% credit floor)
 
 ```python
 from sparket.miner.custom.strategy.timing import TimingStrategy
@@ -318,11 +318,11 @@ SPARKET_CUSTOM_MINER__TIMING__REFRESH_INTERVAL_SECONDS=21600
 
 # ===== Calibration =====
 SPARKET_CUSTOM_MINER__CALIBRATION__ENABLED=true
-SPARKET_CUSTOM_MINER__CALIBRATION__MIN_SAMPLES=30
+SPARKET_CUSTOM_MINER__CALIBRATION__MIN_SAMPLES=100
 
 # ===== Rate Limiting =====
-SPARKET_CUSTOM_MINER__RATE_LIMIT_PER_MINUTE=10
-SPARKET_CUSTOM_MINER__PER_MARKET_LIMIT_PER_MINUTE=2
+SPARKET_CUSTOM_MINER__RATE_LIMIT_PER_MINUTE=60
+SPARKET_CUSTOM_MINER__PER_MARKET_LIMIT_PER_MINUTE=10
 
 # ===== Outcome Detection =====
 SPARKET_CUSTOM_MINER__OUTCOME_CHECK_SECONDS=300
@@ -333,8 +333,8 @@ SPARKET_CUSTOM_MINER__OUTCOME_CHECK_SECONDS=300
 ```python
 @dataclass
 class EloConfig:
-    k_factor: dict = {"NFL": 32, "NBA": 20, "MLB": 8, "NHL": 16}
-    home_advantage: dict = {"NFL": 2.5, "NBA": 3.0, "MLB": 0.5, "NHL": 0.5}
+    k_factor: dict = {"NFL": 20, "NBA": 12, "MLB": 4, "NHL": 10}
+    home_advantage: dict = {"NFL": 48, "NBA": 100, "MLB": 24, "NHL": 33}
     mov_multiplier: float = 1.0
     default_rating: float = 1500.0
 
@@ -342,13 +342,14 @@ class EloConfig:
 class TimingConfig:
     early_submission_days: int = 7
     refresh_interval_seconds: int = 21600  # 6 hours
-    cutoff_hours: float = 2.0
+    min_hours_before_event: float = 1.0    # validator min_minutes=60
+    cutoff_hours: float = 0.25
 
 @dataclass
 class CalibrationConfig:
     enabled: bool = True
-    min_samples: int = 30
-    retrain_interval: int = 10  # refit every N samples
+    min_samples: int = 100
+    retrain_interval: int = 500  # refit every N samples
 
 @dataclass
 class CustomMinerConfig:
@@ -359,8 +360,8 @@ class CustomMinerConfig:
     vig: float = 0.045
     engine_weights: dict = {"elo": 0.35, "market": 0.55, "poisson": 0.10}
     odds_api_key: str | None = None
-    rate_limit_per_minute: int = 10
-    per_market_limit_per_minute: int = 2
+    rate_limit_per_minute: int = 60
+    per_market_limit_per_minute: int = 10
     outcome_check_seconds: int = 300
 ```
 
@@ -589,7 +590,9 @@ When submitting to validators:
 - `odds_eu` must be in range `(1.01, 1000]`
 - `imp_prob` must be in range `(0.001, 0.999)`
 - `kind` must be lowercase: "moneyline", "spread", or "total"
+- `side` must be a valid value: `home`, `away`, `draw`, `over`, `under` (case-insensitive, normalized to uppercase by validator). Invalid sides are silently skipped
 - `priced_at` must be within ±5 minutes of submission time
+- `token` must be included for validators that require it (rotates every ~1 hour)
 
 ---
 
@@ -662,7 +665,7 @@ uv run python -m sparket.miner.custom.data.seed_elo
 - Ensure `--seed-elo` flag is used
 - Use `--warmup 50` to let calibration stabilize
 - Check simulated market noise (should be ~8%)
-- Verify calibration has enough samples (min 30)
+- Verify calibration has enough samples (min 100)
 
 ### Custom miner not starting in PM2
 - Check `SPARKET_CUSTOM_MINER__ENABLED=true` is set
@@ -682,4 +685,4 @@ uv run python -m sparket.miner.custom.data.seed_elo
 
 ---
 
-*Last updated: January 2026*
+*Last updated: February 2026*

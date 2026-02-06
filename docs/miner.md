@@ -33,8 +33,10 @@ Validator                          Miner
 ```
 
 The miner stores this endpoint and uses it for all subsequent requests.
-The `push_token` rotates and must be included in submissions for validators
-that require it (`api.require_push_token: true`).
+The `push_token` rotates on a time-based schedule (default: every 1 hour)
+and must be included in submissions for validators that require it
+(`api.require_push_token: true`). Validators accept the current and
+previous token to allow for clock drift.
 
 ### 2. Game Data Request (Miner → Validator)
 
@@ -90,7 +92,7 @@ Miner                              Validator
 **Submission fields:**
 - `odds_eu`: Decimal odds (e.g., 1.91 = -110 American, 2.00 = even money)
 - `imp_prob`: Implied probability (0 to 1, before vig normalization)
-- `side`: The outcome being priced (home/away for moneyline/spread, over/under for totals)
+- `side`: The outcome being priced (case-insensitive, normalized to uppercase by validator). Valid values: `home`, `away`, `draw`, `over`, `under`
 
 The validator:
 1. Validates the submission (rate limits, schema, timing)
@@ -692,9 +694,9 @@ sudo ufw status
 **Symptom:** `{"submit_odds_rejected": {"error": "token_invalid"}}`
 
 **Causes:**
-1. **Clock skew** - Token epochs are time-based
+1. **Clock skew** - Tokens are time-based (epoch = unix_time / rotation_seconds). Clock drift > 1 rotation window causes rejection
 2. **Validator not pushing** - No CONNECTION_INFO_PUSH received
-3. **Stale token** - Token rotates every ~10 validator steps
+3. **Stale token** - Token rotates every ~1 hour by default. Validators accept current + previous epoch tokens
 
 **Checks:**
 ```bash
