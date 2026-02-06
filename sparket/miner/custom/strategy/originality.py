@@ -68,6 +68,14 @@ class SubmissionRecord:
 
 
 @dataclass
+class TimeSeriesPoint:
+    """A point in the miner/market probability time series."""
+    timestamp: float
+    miner_prob: float
+    market_prob: float
+
+
+@dataclass
 class MarketMoveRecord:
     """Record of a market move we anticipated or followed."""
     timestamp: float
@@ -133,6 +141,9 @@ class OriginalityTracker:
         # Market move history for lead ratio
         self._market_moves: List[MarketMoveRecord] = []
 
+        # Per-market time series for Pearson correlation SOS
+        self._time_series: Dict[int, List[TimeSeriesPoint]] = {}
+
         # Per-market tracking of our last submission
         self._last_submission: Dict[int, SubmissionRecord] = {}
 
@@ -143,6 +154,25 @@ class OriginalityTracker:
 
         if self._data_path and self._data_path.exists():
             self._load()
+
+    def get_differentiation_strength(self) -> float:
+        """Get how much to lean toward proprietary signal (Elo) vs market.
+
+        Returns 0.0 (SOS is good, don't differentiate) to 1.0 (SOS is bad,
+        differentiate strongly).
+        """
+        sos = self.get_sos_estimate()
+
+        # SOS >= 0.5 → good originality, no differentiation needed
+        # SOS 0.15-0.5 → moderate, linear interpolation
+        # SOS <= 0.15 → highly correlated, need strong differentiation
+        if sos >= 0.5:
+            return 0.0
+        elif sos <= 0.15:
+            return 1.0
+        else:
+            # Linear interpolation: 0.15 → 1.0, 0.5 → 0.0
+            return max(0.0, (0.5 - sos) / 0.35)
 
     def should_differentiate(
         self,
@@ -256,6 +286,11 @@ class OriginalityTracker:
         self._last_submission[market_id] = record
         self._total_submissions += 1
 
+        # Track time series for Pearson correlation SOS
+        self._time_series.setdefault(market_id, []).append(
+            TimeSeriesPoint(timestamp=ts, miner_prob=our_prob, market_prob=market_prob)
+        )
+
         # Check if we led a market move
         self._check_for_lead(market_id, our_prob, market_prob, ts)
 
@@ -331,10 +366,12 @@ class OriginalityTracker:
         return record
 
     def get_sos_estimate(self, window_hours: float = 168.0) -> float:
-        """Estimate our current SOS score.
+        """Estimate our current SOS score via Pearson correlation.
 
-        SOS = 1 - |correlation with market|
-        Higher is better (more original).
+        Matches the validator's computation:
+        SOS = 1 - |Pearson_corr(miner_5min_buckets, truth_5min_buckets)|
+
+        Higher is better (more original / less correlated with market).
 
         Args:
             window_hours: Hours to look back
@@ -343,35 +380,46 @@ class OriginalityTracker:
             Estimated SOS score (0-1)
         """
         cutoff = time.time() - (window_hours * 3600)
-        recent = [s for s in self._submissions if s.timestamp >= cutoff]
+        BUCKET_SECONDS = 300  # 5-min buckets matching validator
 
-        if len(recent) < 10:
+        all_miner_vals: List[float] = []
+        all_market_vals: List[float] = []
+
+        for market_id, points in self._time_series.items():
+            recent = [p for p in points if p.timestamp >= cutoff]
+            if len(recent) < 3:
+                continue
+
+            # Bucket to 5-min intervals (take last value per bucket)
+            buckets: Dict[int, TimeSeriesPoint] = {}
+            for p in recent:
+                bucket_key = int(p.timestamp - (p.timestamp % BUCKET_SECONDS))
+                buckets[bucket_key] = p  # Last value wins
+
+            for bp in buckets.values():
+                all_miner_vals.append(bp.miner_prob)
+                all_market_vals.append(bp.market_prob)
+
+        if len(all_miner_vals) < 10:
             return 0.5  # Default for insufficient data
 
-        # Calculate average absolute difference
-        avg_abs_diff = sum(abs(s.difference) for s in recent) / len(recent)
+        # Pearson correlation
+        n = len(all_miner_vals)
+        mean_m = sum(all_miner_vals) / n
+        mean_k = sum(all_market_vals) / n
+        cov = sum(
+            (m - mean_m) * (k - mean_k)
+            for m, k in zip(all_miner_vals, all_market_vals)
+        ) / n
+        std_m = (sum((m - mean_m) ** 2 for m in all_miner_vals) / n) ** 0.5
+        std_k = (sum((k - mean_k) ** 2 for k in all_market_vals) / n) ** 0.5
 
-        # Convert to SOS estimate
-        # SOS ≈ 1 - correlation
-        # If avg_diff is ~3%, correlation is ~0.7, SOS is ~0.3
-        # If avg_diff is ~5%, correlation is ~0.5, SOS is ~0.5
-        # If avg_diff is ~8%, correlation is ~0.2, SOS is ~0.8
+        if std_m < 1e-9 or std_k < 1e-9:
+            return 0.5
 
-        # Approximate mapping (based on typical correlations)
-        if avg_abs_diff < 0.01:
-            sos = 0.1  # Very correlated
-        elif avg_abs_diff < 0.02:
-            sos = 0.25
-        elif avg_abs_diff < 0.03:
-            sos = 0.4
-        elif avg_abs_diff < 0.05:
-            sos = 0.55
-        elif avg_abs_diff < 0.08:
-            sos = 0.7
-        else:
-            sos = 0.85  # Very different
-
-        return sos
+        corr = cov / (std_m * std_k)
+        corr = max(-1.0, min(1.0, corr))
+        return 1.0 - abs(corr)
 
     def get_lead_ratio(self, window_hours: float = 168.0) -> float:
         """Get our lead ratio for recent market moves.
@@ -439,6 +487,15 @@ class OriginalityTracker:
         self._submissions = [s for s in self._submissions if s.timestamp >= cutoff]
         self._market_moves = [m for m in self._market_moves if m.timestamp >= cutoff]
 
+        # Prune time series
+        empty_markets = []
+        for market_id, points in self._time_series.items():
+            self._time_series[market_id] = [p for p in points if p.timestamp >= cutoff]
+            if not self._time_series[market_id]:
+                empty_markets.append(market_id)
+        for mid in empty_markets:
+            del self._time_series[mid]
+
         # Clean up last_submission for old markets
         old_markets = [
             mid for mid, sub in self._last_submission.items()
@@ -468,9 +525,19 @@ class OriginalityTracker:
         try:
             self._data_path.parent.mkdir(parents=True, exist_ok=True)
 
+            # Serialize time series (keep last 500 points per market, last 50 markets)
+            ts_data: Dict[str, List[Dict[str, float]]] = {}
+            for mid in sorted(self._time_series.keys())[-50:]:
+                points = self._time_series[mid][-500:]
+                ts_data[str(mid)] = [
+                    {"t": p.timestamp, "m": p.miner_prob, "k": p.market_prob}
+                    for p in points
+                ]
+
             data = {
                 "submissions": [s.to_dict() for s in self._submissions[-1000:]],
                 "market_moves": [m.to_dict() for m in self._market_moves[-500:]],
+                "time_series": ts_data,
                 "total_submissions": self._total_submissions,
                 "total_leads": self._total_leads,
                 "total_lags": self._total_lags,
@@ -509,6 +576,15 @@ class OriginalityTracker:
                     our_move_time=m.get("our_move_time"),
                 ))
 
+            # Load time series
+            self._time_series = {}
+            for mid_str, points in data.get("time_series", {}).items():
+                mid = int(mid_str)
+                self._time_series[mid] = [
+                    TimeSeriesPoint(timestamp=p["t"], miner_prob=p["m"], market_prob=p["k"])
+                    for p in points
+                ]
+
             self._total_submissions = data.get("total_submissions", len(self._submissions))
             self._total_leads = data.get("total_leads", 0)
             self._total_lags = data.get("total_lags", 0)
@@ -517,6 +593,7 @@ class OriginalityTracker:
                 "originality": "loaded",
                 "submissions": len(self._submissions),
                 "market_moves": len(self._market_moves),
+                "time_series_markets": len(self._time_series),
             })
 
         except Exception as e:
@@ -531,4 +608,5 @@ __all__ = [
     "DifferentiationDecision",
     "SubmissionRecord",
     "MarketMoveRecord",
+    "TimeSeriesPoint",
 ]

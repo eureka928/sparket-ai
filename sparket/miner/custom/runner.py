@@ -324,32 +324,33 @@ class CustomMiner:
                 cal_away = 1.0 - cal_home
                 shrinkage_applied = shrink_factor
 
-        # 2b. Apply originality adjustment for InfoDim SOS
-        diff_decision = None
+        # 2b. InfoDim: Elo-anchored differentiation for SOS
+        # Use Elo's disagreement with market as differentiation direction.
+        # Elo updates from game results/ratings (not live market), so it
+        # naturally decorrelates our time series from market odds.
+        diff_adjustment = 0.0
         market_consensus_prob = None
         if market_odds is not None:
             market_consensus_prob = market_odds.home_prob
         if market_consensus_prob is not None:
-            start_time = market.get("start_time_utc")
-            hours_to_game = 24.0
-            if start_time:
-                now = datetime.now(timezone.utc)
-                if isinstance(start_time, str):
-                    start_time = datetime.fromisoformat(
-                        start_time.replace("Z", "+00:00")
-                    )
-                hours_to_game = max(0.0, (start_time - now).total_seconds() / 3600)
-
-            diff_decision = self._originality.should_differentiate(
-                market_id=int(market.get("market_id", 0)),
-                our_prob=cal_home,
-                market_prob=market_consensus_prob,
-                confidence=ensemble_pred.confidence,
-                hours_to_game=hours_to_game,
-            )
-            if diff_decision.suggested_adjustment != 0.0:
-                cal_home = max(0.001, min(0.999, cal_home + diff_decision.suggested_adjustment))
-                cal_away = 1.0 - cal_home
+            diff_strength = self._originality.get_differentiation_strength()
+            if diff_strength > 0.0:
+                # Find Elo component from ensemble
+                elo_comp = next(
+                    (c for c in ensemble_pred.components if c.source == "elo"),
+                    None,
+                )
+                if elo_comp and elo_comp.home_prob is not None:
+                    # Elo's disagreement with market = our differentiation direction
+                    elo_edge = elo_comp.home_prob - market_consensus_prob
+                    # Scale: at full strength, shift up to 50% of Elo's edge
+                    max_shift = 0.05  # Cap at 5% max adjustment
+                    adjustment = elo_edge * diff_strength * 0.5
+                    adjustment = max(-max_shift, min(max_shift, adjustment))
+                    if abs(adjustment) > 0.005:  # Only apply if meaningful
+                        diff_adjustment = adjustment
+                        cal_home = max(0.01, min(0.99, cal_home + adjustment))
+                        cal_away = 1.0 - cal_home
 
         # 3. Apply calibration if enabled and fitted
         if self.config.calibration.enabled and self._calibrator.is_fitted:
@@ -391,8 +392,7 @@ class CustomMiner:
             "models_agreed": ensemble_pred.models_agreed,
             "variance_shrinkage": round(shrinkage_applied, 3) if shrinkage_applied > 0 else None,
             "calibration_applied": self._calibrator.is_fitted,
-            "originality_adj": round(diff_decision.suggested_adjustment, 4) if diff_decision is not None else None,
-            "originality_reason": diff_decision.reason if diff_decision is not None else None,
+            "originality_adj": round(diff_adjustment, 4) if diff_adjustment != 0.0 else None,
         })
 
         return calibrated_odds

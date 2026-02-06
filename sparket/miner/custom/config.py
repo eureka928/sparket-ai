@@ -68,8 +68,8 @@ class TimingConfig:
     # Target: submit 7 days before event
     early_submission_days: float = 7.0
 
-    # Refresh interval (6 hours = 4x/day)
-    refresh_interval_seconds: int = 6 * 3600
+    # Refresh interval (30 minutes for LEAD coverage — validator LEAD window is 30min)
+    refresh_interval_seconds: int = 30 * 60
 
     # Minimum time before event (1 hour matches validator min_minutes=60)
     min_hours_before_event: float = 1.0
