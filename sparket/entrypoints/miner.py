@@ -174,6 +174,8 @@ class Miner(BaseMinerNeuron):
                 env_wallet_hotkey = os.getenv("SPARKET_WALLET__HOTKEY")
                 env_axon_port = os.getenv("SPARKET_AXON__PORT")
                 env_axon_host = os.getenv("SPARKET_AXON__HOST")
+                env_axon_external_ip = os.getenv("SPARKET_AXON__EXTERNAL_IP")
+                env_axon_external_port = os.getenv("SPARKET_AXON__EXTERNAL_PORT")
                 env_netuid = os.getenv("SPARKET_NETUID")
 
                 if env_wallet_name:
@@ -188,6 +190,11 @@ class Miner(BaseMinerNeuron):
                 if env_axon_host:
                     cfg.axon.ip = env_axon_host
                     cfg.axon.external_ip = env_axon_host
+                # Separate external IP/port override (bind 0.0.0.0 but advertise public IP)
+                if env_axon_external_ip:
+                    cfg.axon.external_ip = env_axon_external_ip
+                if env_axon_external_port:
+                    cfg.axon.external_port = int(env_axon_external_port)
                 
                 config = cfg
             except Exception:
