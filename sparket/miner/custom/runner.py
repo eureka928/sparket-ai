@@ -329,10 +329,11 @@ class CustomMiner:
         # Elo updates from game results/ratings (not live market), so it
         # naturally decorrelates our time series from market odds.
         diff_adjustment = 0.0
+        diff_strength = 0.0
         market_consensus_prob = None
         if market_odds is not None:
             market_consensus_prob = market_odds.home_prob
-        if market_consensus_prob is not None:
+        if market_consensus_prob is not None and shrinkage_applied == 0.0:
             diff_strength = self._originality.get_differentiation_strength()
             if diff_strength > 0.0:
                 # Find Elo component from ensemble
@@ -392,6 +393,7 @@ class CustomMiner:
             "models_agreed": ensemble_pred.models_agreed,
             "variance_shrinkage": round(shrinkage_applied, 3) if shrinkage_applied > 0 else None,
             "calibration_applied": self._calibrator.is_fitted,
+            "diff_strength": round(diff_strength, 3) if diff_strength > 0 else None,
             "originality_adj": round(diff_adjustment, 4) if diff_adjustment != 0.0 else None,
         })
 

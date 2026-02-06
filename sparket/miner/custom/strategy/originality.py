@@ -365,11 +365,31 @@ class OriginalityTracker:
 
         return record
 
+    @staticmethod
+    def _pearson_corr(xs: List[float], ys: List[float]) -> Optional[float]:
+        """Compute Pearson correlation between two aligned series.
+
+        Returns None if insufficient data or zero variance.
+        """
+        n = len(xs)
+        if n < 3:
+            return None
+        mean_x = sum(xs) / n
+        mean_y = sum(ys) / n
+        cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / n
+        std_x = (sum((x - mean_x) ** 2 for x in xs) / n) ** 0.5
+        std_y = (sum((y - mean_y) ** 2 for y in ys) / n) ** 0.5
+        if std_x < 1e-9 or std_y < 1e-9:
+            return None
+        corr = cov / (std_x * std_y)
+        return max(-1.0, min(1.0, corr))
+
     def get_sos_estimate(self, window_hours: float = 168.0) -> float:
         """Estimate our current SOS score via Pearson correlation.
 
-        Matches the validator's computation:
-        SOS = 1 - |Pearson_corr(miner_5min_buckets, truth_5min_buckets)|
+        Matches the validator's computation: per-market Pearson correlation
+        on 5-min bucketed time series, then average SOS across markets.
+        SOS = 1 - |correlation|
 
         Higher is better (more original / less correlated with market).
 
@@ -382,8 +402,7 @@ class OriginalityTracker:
         cutoff = time.time() - (window_hours * 3600)
         BUCKET_SECONDS = 300  # 5-min buckets matching validator
 
-        all_miner_vals: List[float] = []
-        all_market_vals: List[float] = []
+        sos_per_market: List[float] = []
 
         for market_id, points in self._time_series.items():
             recent = [p for p in points if p.timestamp >= cutoff]
@@ -396,30 +415,20 @@ class OriginalityTracker:
                 bucket_key = int(p.timestamp - (p.timestamp % BUCKET_SECONDS))
                 buckets[bucket_key] = p  # Last value wins
 
-            for bp in buckets.values():
-                all_miner_vals.append(bp.miner_prob)
-                all_market_vals.append(bp.market_prob)
+            if len(buckets) < 3:
+                continue
 
-        if len(all_miner_vals) < 10:
+            miner_vals = [bp.miner_prob for bp in buckets.values()]
+            market_vals = [bp.market_prob for bp in buckets.values()]
+
+            corr = self._pearson_corr(miner_vals, market_vals)
+            if corr is not None:
+                sos_per_market.append(1.0 - abs(corr))
+
+        if not sos_per_market:
             return 0.5  # Default for insufficient data
 
-        # Pearson correlation
-        n = len(all_miner_vals)
-        mean_m = sum(all_miner_vals) / n
-        mean_k = sum(all_market_vals) / n
-        cov = sum(
-            (m - mean_m) * (k - mean_k)
-            for m, k in zip(all_miner_vals, all_market_vals)
-        ) / n
-        std_m = (sum((m - mean_m) ** 2 for m in all_miner_vals) / n) ** 0.5
-        std_k = (sum((k - mean_k) ** 2 for k in all_market_vals) / n) ** 0.5
-
-        if std_m < 1e-9 or std_k < 1e-9:
-            return 0.5
-
-        corr = cov / (std_m * std_k)
-        corr = max(-1.0, min(1.0, corr))
-        return 1.0 - abs(corr)
+        return sum(sos_per_market) / len(sos_per_market)
 
     def get_lead_ratio(self, window_hours: float = 168.0) -> float:
         """Get our lead ratio for recent market moves.
@@ -506,15 +515,18 @@ class OriginalityTracker:
 
     def stats(self) -> Dict[str, Any]:
         """Get originality tracking statistics."""
+        sos = self.get_sos_estimate()
         return {
             "total_submissions": self._total_submissions,
             "total_leads": self._total_leads,
             "total_lags": self._total_lags,
             "lead_ratio": self.get_lead_ratio(),
-            "sos_estimate": round(self.get_sos_estimate(), 3),
+            "sos_estimate": round(sos, 3),
+            "differentiation_strength": round(self.get_differentiation_strength(), 3),
             "info_dim_estimate": round(self.get_info_dim_estimate(), 3),
             "recent_submissions": len(self._submissions),
             "recent_market_moves": len(self._market_moves),
+            "time_series_markets": len(self._time_series),
         }
 
     def _save(self) -> None:
