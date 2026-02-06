@@ -172,9 +172,9 @@ class PoissonEngine:
             })
             return None
 
-        # Get expected scoring for each team
-        home_expected = self._get_team_expected(home_team, sport, is_home=True)
-        away_expected = self._get_team_expected(away_team, sport, is_home=False)
+        # Get expected scoring for each team (including opponent defense)
+        home_expected = self._get_team_expected(home_team, sport, is_home=True, opponent=away_team)
+        away_expected = self._get_team_expected(away_team, sport, is_home=False, opponent=home_team)
 
         expected_total = home_expected + away_expected
 
@@ -210,6 +210,7 @@ class PoissonEngine:
         team: str,
         sport: str,
         is_home: bool,
+        opponent: str = "",
     ) -> float:
         """Get expected points/goals for a team.
 
@@ -217,6 +218,7 @@ class PoissonEngine:
             team: Team code
             sport: Sport code
             is_home: Whether team is playing at home
+            opponent: Opponent team code (for defense adjustment)
 
         Returns:
             Expected points/goals for the team
@@ -232,11 +234,16 @@ class PoissonEngine:
         else:
             base_expected -= sport_params.get("home_boost", 0) / 2
 
-        # Apply team adjustments
+        # Apply team offense adjustment
         team_adj = self._team_adjustments.get(team, {})
         offense_adj = team_adj.get("offense", 0.0)
 
-        return base_expected + offense_adj
+        # Apply opponent defense adjustment
+        # Negative defense_adj = good defense = fewer points allowed
+        opp_adj = self._team_adjustments.get(opponent, {})
+        opp_defense_adj = opp_adj.get("defense", 0.0)
+
+        return base_expected + offense_adj + opp_defense_adj
 
     def _calculate_over_probability(
         self,

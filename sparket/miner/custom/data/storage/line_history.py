@@ -293,11 +293,14 @@ class LineHistory:
         now = time.time()
         window_start = now - (hours * 3600)
 
-        # Filter to window
-        window_points = [p for p in points if p.timestamp >= window_start]
+        # Filter to market-only sources in window (exclude our own predictions)
+        window_points = [p for p in points if p.timestamp >= window_start and p.source == "market"]
         if not window_points:
-            # Use most recent point
-            return (points[-1].home_prob, points[-1].away_prob)
+            # Fall back to most recent market point
+            market_points = [p for p in points if p.source == "market"]
+            if market_points:
+                return (market_points[-1].home_prob, market_points[-1].away_prob)
+            return None  # No market data at all
 
         # Time-weighted average (more recent = more weight)
         total_weight = 0.0

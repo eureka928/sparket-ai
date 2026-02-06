@@ -49,8 +49,8 @@ class EconTracker:
 
     # Validator uses 10-day half-life decay
     DECAY_HALF_LIFE_DAYS = 10.0
-    # Keep 60 days of history (matches validator's rolling window)
-    MAX_AGE_DAYS = 60.0
+    # Keep 30 days of history (matches validator's rolling window)
+    MAX_AGE_DAYS = 30.0
 
     def __init__(
         self,
@@ -153,6 +153,18 @@ class EconTracker:
         mes_values = [1.0 - min(1.0, abs(clv)) for clv in clv_values]
         mes_mean = sum(w * m for w, m in zip(weights, mes_values)) / total_weight
 
+        # Log-scaled shrinkage matching validator (k=200)
+        SHRINKAGE_K = 200.0
+        n_eff = total_weight  # sum of decay weights = effective sample size
+        if n_eff > 0:
+            shrink_weight = math.log(1 + n_eff) / math.log(1 + n_eff + SHRINKAGE_K)
+        else:
+            shrink_weight = 0.0
+
+        # Shrink toward neutral defaults (no population available)
+        es_sharpe = shrink_weight * es_sharpe  # neutral = 0.0
+        mes_mean = shrink_weight * mes_mean + (1 - shrink_weight) * 0.5  # neutral = 0.5
+
         return {
             "cle_mean": cle_mean,
             "cle_std": cle_std,
@@ -175,7 +187,7 @@ class EconTracker:
         # ES normalization: logistic transform of Sharpe
         # Typical Sharpe range is -1 to +1 for betting
         es_raw = stats["es_sharpe"]
-        es_norm = 1.0 / (1.0 + math.exp(-1.5 * es_raw))
+        es_norm = 1.0 / (1.0 + math.exp(-1.0 * es_raw))
 
         # MES is already in [0, 1]
         mes_norm = max(0.0, min(1.0, stats["mes_mean"]))
