@@ -22,6 +22,13 @@ from sparket.validator.ledger.auth import AccessPolicy
 from sparket.validator.ledger.store.filesystem import FilesystemStore
 
 
+def _hk(hotkey: str | None) -> str:
+    """Truncate hotkey for log readability."""
+    if not hotkey:
+        return "none"
+    return hotkey[:16]
+
+
 class LedgerHTTPServer:
     """Lightweight async HTTP server for ledger distribution."""
 
@@ -74,15 +81,18 @@ class LedgerHTTPServer:
             body = await request.json()
             hotkey = body.get("hotkey", "")
         except Exception:
+            bt.logging.warning({"ledger_request": {"endpoint": "auth/challenge", "status": 400, "error": "invalid_body"}})
             return web.json_response({"error": "invalid_body"}, status=400)
 
         result = self.access_policy.check_eligibility(hotkey)
         if not result.eligible:
+            bt.logging.info({"ledger_request": {"endpoint": "auth/challenge", "hotkey": _hk(hotkey), "status": 403, "reason": result.reason}})
             return web.json_response(
                 {"error": "ineligible", "reason": result.reason}, status=403,
             )
 
         nonce = self.access_policy.issue_challenge(hotkey)
+        bt.logging.info({"ledger_request": {"endpoint": "auth/challenge", "hotkey": _hk(hotkey), "status": 200}})
         return web.json_response({"nonce": nonce})
 
     async def _handle_respond(self, request: web.Request) -> web.Response:
@@ -93,12 +103,15 @@ class LedgerHTTPServer:
             nonce = body.get("nonce", "")
             signature = body.get("signature", "")
         except Exception:
+            bt.logging.warning({"ledger_request": {"endpoint": "auth/respond", "status": 400, "error": "invalid_body"}})
             return web.json_response({"error": "invalid_body"}, status=400)
 
         token = self.access_policy.verify_response(hotkey, nonce, signature)
         if token is None:
+            bt.logging.warning({"ledger_request": {"endpoint": "auth/respond", "hotkey": _hk(hotkey), "status": 403}})
             return web.json_response({"error": "auth_failed"}, status=403)
 
+        bt.logging.info({"ledger_request": {"endpoint": "auth/respond", "hotkey": _hk(hotkey), "status": 200}})
         return web.json_response({"token": token})
 
     # -- Auth middleware --
@@ -116,24 +129,30 @@ class LedgerHTTPServer:
     async def _handle_latest_checkpoint(self, request: web.Request) -> web.Response:
         hotkey = self._check_auth(request)
         if hotkey is None:
+            bt.logging.debug({"ledger_request": {"endpoint": "checkpoints/latest", "status": 401}})
             return web.json_response({"error": "unauthorized"}, status=401)
 
         if not self.access_policy.check_rate_limit(hotkey):
+            bt.logging.warning({"ledger_request": {"endpoint": "checkpoints/latest", "hotkey": _hk(hotkey), "status": 429}})
             return web.json_response({"error": "rate_limited"}, status=429)
 
         cp = await self.store.get_latest_checkpoint()
         if cp is None:
+            bt.logging.info({"ledger_request": {"endpoint": "checkpoints/latest", "hotkey": _hk(hotkey), "status": 404}})
             return web.json_response({"error": "no_checkpoint"}, status=404)
 
         data = cp.model_dump(mode="json")
+        bt.logging.info({"ledger_request": {"endpoint": "checkpoints/latest", "hotkey": _hk(hotkey), "status": 200, "miners": len(cp.accumulators)}})
         return web.json_response(data)
 
     async def _handle_list_deltas(self, request: web.Request) -> web.Response:
         hotkey = self._check_auth(request)
         if hotkey is None:
+            bt.logging.debug({"ledger_request": {"endpoint": "deltas", "status": 401}})
             return web.json_response({"error": "unauthorized"}, status=401)
 
         if not self.access_policy.check_rate_limit(hotkey):
+            bt.logging.warning({"ledger_request": {"endpoint": "deltas", "hotkey": _hk(hotkey), "status": 429}})
             return web.json_response({"error": "rate_limited"}, status=429)
 
         try:
@@ -150,22 +169,27 @@ class LedgerHTTPServer:
                 return web.json_response({"error": "invalid_since"}, status=400)
 
         delta_ids = await self.store.list_deltas(epoch, since)
+        bt.logging.info({"ledger_request": {"endpoint": "deltas", "hotkey": _hk(hotkey), "status": 200, "count": len(delta_ids)}})
         return web.json_response({"deltas": delta_ids, "epoch": epoch})
 
     async def _handle_get_delta(self, request: web.Request) -> web.Response:
         hotkey = self._check_auth(request)
         if hotkey is None:
+            bt.logging.debug({"ledger_request": {"endpoint": "deltas/{id}", "status": 401}})
             return web.json_response({"error": "unauthorized"}, status=401)
 
         if not self.access_policy.check_rate_limit(hotkey):
+            bt.logging.warning({"ledger_request": {"endpoint": "deltas/{id}", "hotkey": _hk(hotkey), "status": 429}})
             return web.json_response({"error": "rate_limited"}, status=429)
 
         delta_id = request.match_info["delta_id"]
         delta = await self.store.get_delta(delta_id)
         if delta is None:
+            bt.logging.info({"ledger_request": {"endpoint": "deltas/{id}", "hotkey": _hk(hotkey), "status": 404, "delta_id": delta_id}})
             return web.json_response({"error": "not_found"}, status=404)
 
         data = delta.model_dump(mode="json")
+        bt.logging.info({"ledger_request": {"endpoint": "deltas/{id}", "hotkey": _hk(hotkey), "status": 200, "delta_id": delta_id}})
         return web.json_response(data)
 
     async def _handle_recompute(self, request: web.Request) -> web.Response:
@@ -173,6 +197,7 @@ class LedgerHTTPServer:
         # Only allow from localhost
         peer = request.remote
         if peer not in ("127.0.0.1", "::1", "localhost"):
+            bt.logging.warning({"ledger_request": {"endpoint": "recompute", "status": 403, "peer": peer}})
             return web.json_response({"error": "forbidden"}, status=403)
 
         if self.exporter is None:
@@ -194,6 +219,7 @@ class LedgerHTTPServer:
             severity=severity,
         )
 
+        bt.logging.info({"ledger_request": {"endpoint": "recompute", "status": 200, "epoch": cp.manifest.checkpoint_epoch}})
         return web.json_response({
             "epoch": cp.manifest.checkpoint_epoch,
             "status": "ok",

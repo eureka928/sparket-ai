@@ -1,6 +1,6 @@
 [project]
 name = "sparket-subnet"
-version = "0.0.3"
+version = "0.0.4"
 description = "sparket-subnet"
 readme = "README.md"
 license = "MIT"

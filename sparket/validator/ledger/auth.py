@@ -93,16 +93,20 @@ class AccessPolicy:
         2. validator_permit == True  (skipped in test mode)
         3. stake >= min_stake_threshold  (skipped in test mode)
         """
+        def _reject(reason: str) -> EligibilityResult:
+            bt.logging.warning({"ledger_auth": {"event": "eligibility_rejected", "hotkey": hotkey[:16] if hotkey else "none", "reason": reason}})
+            return EligibilityResult(eligible=False, reason=reason)
+
         if not hotkey:
-            return EligibilityResult(eligible=False, reason="empty_hotkey")
+            return _reject("empty_hotkey")
 
         try:
             hotkeys = list(self.metagraph.hotkeys)
         except Exception:
-            return EligibilityResult(eligible=False, reason="metagraph_unavailable")
+            return _reject("metagraph_unavailable")
 
         if hotkey not in hotkeys:
-            return EligibilityResult(eligible=False, reason="hotkey_not_found")
+            return _reject("hotkey_not_found")
 
         # In test mode, only require hotkey presence in metagraph
         if os.environ.get("SPARKET_TEST_MODE", "").lower() in ("true", "1"):
@@ -114,10 +118,10 @@ class AccessPolicy:
         try:
             vpermit = bool(self.metagraph.validator_permit[idx])
         except (IndexError, AttributeError):
-            return EligibilityResult(eligible=False, reason="vpermit_check_failed")
+            return _reject("vpermit_check_failed")
 
         if not vpermit:
-            return EligibilityResult(eligible=False, reason="no_validator_permit")
+            return _reject("no_validator_permit")
 
         # Check stake
         try:
@@ -126,13 +130,10 @@ class AccessPolicy:
             try:
                 stake = float(self.metagraph.stake[idx])
             except (IndexError, AttributeError):
-                return EligibilityResult(eligible=False, reason="stake_check_failed")
+                return _reject("stake_check_failed")
 
         if stake < self.min_stake_threshold:
-            return EligibilityResult(
-                eligible=False,
-                reason=f"stake_too_low:{stake:.0f}<{self.min_stake_threshold}",
-            )
+            return _reject(f"stake_too_low:{stake:.0f}<{self.min_stake_threshold}")
 
         return EligibilityResult(eligible=True)
 
@@ -161,13 +162,18 @@ class AccessPolicy:
         Returns:
             Bearer token string on success, None on failure.
         """
+        hk = hotkey[:16] if hotkey else "none"
+
         # Look up challenge
         challenge = self._challenges.pop(nonce, None)
         if challenge is None:
+            bt.logging.warning({"ledger_auth": {"event": "verify_failed", "hotkey": hk, "reason": "unknown_nonce"}})
             return None
         if challenge.expired:
+            bt.logging.warning({"ledger_auth": {"event": "verify_failed", "hotkey": hk, "reason": "expired_nonce"}})
             return None
         if challenge.hotkey != hotkey:
+            bt.logging.warning({"ledger_auth": {"event": "verify_failed", "hotkey": hk, "reason": "hotkey_mismatch"}})
             return None
 
         # Verify signature
@@ -175,8 +181,10 @@ class AccessPolicy:
             sig_bytes = bytes.fromhex(signature)
             keypair = bt.Keypair(ss58_address=hotkey)
             if not keypair.verify(nonce.encode(), sig_bytes):
+                bt.logging.warning({"ledger_auth": {"event": "verify_failed", "hotkey": hk, "reason": "bad_signature"}})
                 return None
         except Exception:
+            bt.logging.warning({"ledger_auth": {"event": "verify_failed", "hotkey": hk, "reason": "signature_exception"}})
             return None
 
         # Issue token
@@ -188,6 +196,7 @@ class AccessPolicy:
             self._tokens.popitem(last=False)
 
         self._tokens[token] = entry
+        bt.logging.info({"ledger_auth": {"event": "token_issued", "hotkey": hk}})
         return token
 
     def validate_token(self, token: str) -> str | None:
@@ -215,7 +224,10 @@ class AccessPolicy:
         log.append(now)
         self._request_log[hotkey] = log
 
-        return len(log) <= self.rate_limit_per_hour
+        allowed = len(log) <= self.rate_limit_per_hour
+        if not allowed:
+            bt.logging.warning({"ledger_auth": {"event": "rate_limited", "hotkey": hotkey[:16] if hotkey else "none", "requests_in_window": len(log)}})
+        return allowed
 
 
 __all__ = ["AccessPolicy", "EligibilityResult"]
