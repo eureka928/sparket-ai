@@ -292,7 +292,7 @@ higher-ranked position. Contact the Sparket team if unsure.
 Test connectivity to the primary validator:
 
 ```bash
-curl -s http://<primary-ip>:8200/ledger/auth/challenge \
+curl -s http://62.146.174.57:8200/ledger/auth/challenge \
   -X POST -H "Content-Type: application/json" -d '{}'
 # Any JSON response (even an error) means the server is reachable.
 # "Connection refused" means the URL or port is wrong.
@@ -312,8 +312,8 @@ SPARKET_CHAIN__NETUID=57
 
 # Auditor role (required)
 SPARKET_ROLE=auditor
-SPARKET_AUDITOR__PRIMARY_HOTKEY=<primary validator hotkey SS58 address>
-SPARKET_AUDITOR__PRIMARY_URL=http://<primary-ip>:8200
+SPARKET_AUDITOR__PRIMARY_HOTKEY=5GxzfbdPxQ9HQkejbR32JnGE86PrAqxBdxiuYrwvpnfT9jq6
+SPARKET_AUDITOR__PRIMARY_URL=http://62.146.174.57:8200
 
 # Auditor tuning (optional)
 SPARKET_AUDITOR__POLL_INTERVAL_SECONDS=900
@@ -326,9 +326,10 @@ Required:
 - `SPARKET_WALLET__HOTKEY`: Your validator hotkey name.
 - `SPARKET_SUBTENSOR__NETWORK`: Chain network (`finney` for mainnet, `test` for testnet).
 - `SPARKET_CHAIN__NETUID`: Subnet netuid (57 for Sparket mainnet).
-- `SPARKET_AUDITOR__PRIMARY_HOTKEY`: The SS58 address of the primary validator's hotkey.
-  Contact the Sparket team or check subnet announcements for this value.
-- `SPARKET_AUDITOR__PRIMARY_URL`: HTTP endpoint where the primary serves ledger data.
+- `SPARKET_AUDITOR__PRIMARY_HOTKEY`: The SS58 address of the primary validator's hotkey
+  (`5GxzfbdPxQ9HQkejbR32JnGE86PrAqxBdxiuYrwvpnfT9jq6`).
+- `SPARKET_AUDITOR__PRIMARY_URL`: HTTP endpoint where the primary serves ledger data
+  (`http://62.146.174.57:8200`).
 
 Optional:
 - `SPARKET_AUDITOR__POLL_INTERVAL_SECONDS`: How often to check for new data (default: 900 / 15 minutes).
