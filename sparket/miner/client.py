@@ -286,26 +286,30 @@ class ValidatorClient:
             bt.logging.warning({"fetch_game_data": "no_validators_available"})
             return None
         
-        # Query first available validator
-        try:
-            responses = await self._dendrite.forward(
-                axons=axons[:1],  # Just query one validator
-                synapse=syn,
-                timeout=timeout,
-            )
-            
-            if responses and len(responses) > 0:
+        # Try each validator until one responds successfully
+        last_error: str | None = None
+        for idx, axon in enumerate(axons):
+            try:
+                responses = await self._dendrite.forward(
+                    axons=[axon],
+                    synapse=syn,
+                    timeout=timeout,
+                )
+
+                if not responses or len(responses) == 0:
+                    last_error = "empty_response"
+                    continue
+
                 response = responses[0]
-                
+
                 # Check dendrite status code FIRST before processing response
                 # Security middleware may reject with 429 (cooldown) or 403 (blacklist)
                 dendrite_info = getattr(response, "dendrite", None)
                 status_code = getattr(dendrite_info, "status_code", None) if dendrite_info else None
                 status_msg = getattr(dendrite_info, "status_message", "") if dendrite_info else ""
-                
+
                 # Handle rejection responses (don't treat as valid game data)
                 if status_code == 429:
-                    # Cooldown - extract retry time if available
                     bt.logging.info({
                         "fetch_game_data_cooldown": {
                             "status_code": status_code,
@@ -316,7 +320,6 @@ class ValidatorClient:
                     self._trigger_backoff()
                     return None
                 elif status_code == 403:
-                    # Forbidden (blacklisted or not registered)
                     bt.logging.warning({
                         "fetch_game_data_forbidden": {
                             "status_code": status_code,
@@ -325,60 +328,48 @@ class ValidatorClient:
                     })
                     return None
                 elif status_code is not None and status_code >= 400:
-                    # Other error response
-                    bt.logging.warning({
-                        "fetch_game_data_error_response": {
-                            "status_code": status_code,
-                            "message": status_msg,
-                        }
-                    })
-                    return None
-                
+                    last_error = f"http_{status_code}"
+                    continue  # Try next validator
+
                 # Handle both SparketSynapse and dict responses
-                # Bittensor may return the deserialized payload directly as a dict
                 if isinstance(response, dict):
                     result = response
                 elif hasattr(response, "payload") and isinstance(response.payload, dict):
                     result = response.payload
                 else:
-                    bt.logging.warning({
-                        "fetch_game_data": "unexpected_response_type",
-                        "response_type": type(response).__name__,
-                    })
-                    return None
-                
-                # Check for not_ready error - trigger backoff
+                    last_error = f"unexpected_type:{type(response).__name__}"
+                    continue
+
+                # Check for not_ready error - try next validator before triggering backoff
                 error_code = result.get("error")
                 if error_code == "not_ready":
-                    bt.logging.info({
-                        "fetch_game_data_validator_not_ready": {
-                            "message": result.get("message", ""),
-                            "will_backoff": True,
-                        }
-                    })
-                    self._trigger_backoff()
-                    return None
+                    last_error = "not_ready"
+                    continue
                 elif error_code:
-                    bt.logging.warning({"fetch_game_data_error": error_code})
-                    return None
-                
+                    last_error = error_code
+                    continue
+
                 # Success - reset backoff
                 self._reset_backoff()
-                
-                # Response format: games (with embedded markets), retrieved_at
+
                 games = result.get("games", [])
                 bt.logging.info({
                     "fetch_game_data": {
                         "games": len(games),
                         "retrieved_at": result.get("retrieved_at"),
+                        "validator_idx": idx,
                     }
                 })
                 return result
-            else:
-                bt.logging.warning({"fetch_game_data": "empty_response"})
-            return None
-        except Exception as e:
-            bt.logging.warning({"fetch_game_data_exception": str(e)})
-            return None
+
+            except Exception as e:
+                last_error = str(e)
+                continue
+
+        # All validators failed
+        if last_error == "not_ready":
+            self._trigger_backoff()
+        bt.logging.warning({"fetch_game_data": "all_validators_failed", "last_error": last_error})
+        return None
 
 

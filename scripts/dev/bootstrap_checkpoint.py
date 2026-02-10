@@ -41,7 +41,7 @@ async def main() -> None:
     dbm = DBM.get_manager(app_config)
 
     # Use the local-validator wallet for signing
-    wallet = bt.wallet(name="local-validator", hotkey="default")
+    wallet = bt.Wallet(name="local-validator", hotkey="default")
     netuid = int(os.environ.get("SPARKET_CHAIN__NETUID", "2"))
     data_dir = os.environ.get(
         "SPARKET_LEDGER__DATA_DIR",

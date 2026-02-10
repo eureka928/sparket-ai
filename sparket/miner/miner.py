@@ -432,3 +432,7 @@ class BaseMinerNeuron(BaseNeuron):
 
         # Sync the metagraph.
         self.metagraph.sync(subtensor=self.subtensor)
+
+        # Keep ValidatorClient's metagraph reference fresh
+        if hasattr(self, "validator_client"):
+            self.validator_client._metagraph = self.metagraph

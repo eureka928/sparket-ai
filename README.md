@@ -31,8 +31,9 @@ See the validator and miner guides for full setup details.
 
 ## Documentation
 - Docs index: [`docs/README.md`](docs/README.md)
-- Validator guide: [`docs/validator.md`](docs/validator.md)
+- Validator guide: [`docs/validator.md`](docs/validator.md) (includes auditor mode setup)
 - Miner guide: [`docs/miner.md`](docs/miner.md)
+- Architecture: [`docs/architecture.md`](docs/architecture.md) (primary + auditor model)
 - Incentive mechanism: [`docs/im.md`](docs/im.md)
 - mdbook summary: [`docs/SUMMARY.md`](docs/SUMMARY.md)
 

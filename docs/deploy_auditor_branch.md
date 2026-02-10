@@ -1,5 +1,9 @@
 # Deploying the Auditor Branch to Production
 
+> **Audience:** This guide is for the Sparket team deploying the primary
+> validator. If you are setting up an **auditor validator**, see the
+> [Auditor Mode section in validator.md](validator.md#auditor-mode).
+
 Quick guide for getting the `auditor` branch running on the production
 validator. Covers migration, configuration, and first-run verification.
 
