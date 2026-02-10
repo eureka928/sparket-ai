@@ -178,3 +178,7 @@ sparket/data/prod/*.db
 sparket/data/prod/*.db-*
 sparket/data/test/*.db
 sparket/data/test/*.db-*
+
+# Ledger and auditor runtime data (generated at runtime, never committed)
+sparket/data/ledger/
+sparket/data/auditor/

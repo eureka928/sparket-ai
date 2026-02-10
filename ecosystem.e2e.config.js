@@ -91,7 +91,11 @@ module.exports = {
         SPARKET_WALLET__HOTKEY: 'default',
         SPARKET_AXON__HOST: '0.0.0.0',
         SPARKET_AXON__PORT: '8093',
-        // Control API port (validator uses 8199)
+        // Ledger endpoint for auditor validators
+        SPARKET_LEDGER__ENABLED: 'true',
+        SPARKET_LEDGER__HTTP_PORT: '8200',
+        SPARKET_LEDGER__MIN_STAKE_THRESHOLD: '0',
+        SPARKET_LEDGER__DATA_DIR: path.join(projectRoot, 'sparket/data/ledger'),
       },
       
       autorestart: true,
@@ -148,5 +152,45 @@ module.exports = {
       
       kill_timeout: 5000,
     })),
+    
+    // Auditor validator (uses e2e-miner-3 wallet, repurposed)
+    {
+      name: 'e2e-auditor',
+      script: path.join(projectRoot, 'sparket/entrypoints/auditor.py'),
+      interpreter,
+      cwd: projectRoot,
+      instances: 1,
+      exec_mode: 'fork',
+      
+      args: '--wallet.name e2e-miner-3 --wallet.hotkey default --subtensor.chain_endpoint ws://127.0.0.1:9945 --netuid 2 --logging.trace --logging.debug --logging.info',
+      
+      env: {
+        ...baseEnv,
+        SPARKET_ROLE: 'auditor',
+        SPARKET_WALLET__NAME: 'e2e-miner-3',
+        SPARKET_WALLET__HOTKEY: 'default',
+        SPARKET_AUDITOR__PRIMARY_HOTKEY: '5HKjkxQxGrVZDHZKVHRQua1nTnvHgEz8mX67wqVzgNU6a3EK',
+        SPARKET_AUDITOR__PRIMARY_URL: 'http://127.0.0.1:8200',
+        SPARKET_AUDITOR__POLL_INTERVAL_SECONDS: '30',
+        SPARKET_AUDITOR__WEIGHT_TOLERANCE: '0.01',
+        SPARKET_AUDITOR__DATA_DIR: path.join(projectRoot, 'sparket/data/auditor'),
+      },
+      
+      autorestart: true,
+      watch: false,
+      max_memory_restart: '512M',
+      min_uptime: '10s',
+      max_restarts: 5,
+      restart_delay: 5000,
+      
+      error_file: path.join(logDir, 'e2e-auditor-error.log'),
+      out_file: path.join(logDir, 'e2e-auditor-out.log'),
+      log_file: path.join(logDir, 'e2e-auditor-combined.log'),
+      time: true,
+      log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
+      merge_logs: true,
+      
+      kill_timeout: 5000,
+    },
   ],
 };

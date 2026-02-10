@@ -90,8 +90,8 @@ class AccessPolicy:
 
         Requirements:
         1. Hotkey exists in metagraph
-        2. validator_permit == True
-        3. stake >= min_stake_threshold
+        2. validator_permit == True  (skipped in test mode)
+        3. stake >= min_stake_threshold  (skipped in test mode)
         """
         if not hotkey:
             return EligibilityResult(eligible=False, reason="empty_hotkey")
@@ -103,6 +103,10 @@ class AccessPolicy:
 
         if hotkey not in hotkeys:
             return EligibilityResult(eligible=False, reason="hotkey_not_found")
+
+        # In test mode, only require hotkey presence in metagraph
+        if os.environ.get("SPARKET_TEST_MODE", "").lower() in ("true", "1"):
+            return EligibilityResult(eligible=True)
 
         idx = hotkeys.index(hotkey)
 

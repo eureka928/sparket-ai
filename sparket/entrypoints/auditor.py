@@ -22,11 +22,12 @@ def main() -> None:
 
     bt.logging.info({"auditor": "starting"})
 
-    # Parse args
+    # Parse args using the v10 API (capitalised class names)
     import argparse
     parser = argparse.ArgumentParser(description="Sparket Auditor Validator")
-    bt.wallet.add_args(parser)
-    bt.subtensor.add_args(parser)
+    bt.Wallet.add_args(parser)
+    bt.Subtensor.add_args(parser)
+    bt.logging.add_args(parser)
     parser.add_argument("--netuid", type=int, default=57)
     parser.add_argument("--auditor.primary_hotkey", type=str, required=False)
     parser.add_argument("--auditor.primary_url", type=str, required=False)
@@ -34,29 +35,30 @@ def main() -> None:
     parser.add_argument("--auditor.weight_tolerance", type=float, default=0.001)
     parser.add_argument("--auditor.data_dir", type=str, default="sparket/data/auditor")
 
-    config = bt.config(parser)
+    args = parser.parse_args()
 
-    # Override from env vars
+    # Override from env vars (env takes precedence over CLI)
     primary_hotkey = os.environ.get(
         "SPARKET_AUDITOR__PRIMARY_HOTKEY",
-        getattr(config, "auditor", {}).get("primary_hotkey", ""),
+        getattr(args, "auditor.primary_hotkey", None) or "",
     )
     primary_url = os.environ.get(
         "SPARKET_AUDITOR__PRIMARY_URL",
-        getattr(config, "auditor", {}).get("primary_url", ""),
+        getattr(args, "auditor.primary_url", None) or "",
     )
     poll_interval = int(os.environ.get(
         "SPARKET_AUDITOR__POLL_INTERVAL_SECONDS",
-        getattr(config, "auditor", {}).get("poll_interval", 900),
+        getattr(args, "auditor.poll_interval", 900),
     ))
     weight_tolerance = float(os.environ.get(
         "SPARKET_AUDITOR__WEIGHT_TOLERANCE",
-        getattr(config, "auditor", {}).get("weight_tolerance", 0.001),
+        getattr(args, "auditor.weight_tolerance", 0.001),
     ))
     data_dir = os.environ.get(
         "SPARKET_AUDITOR__DATA_DIR",
-        getattr(config, "auditor", {}).get("data_dir", "sparket/data/auditor"),
+        getattr(args, "auditor.data_dir", "sparket/data/auditor"),
     )
+    netuid = int(os.environ.get("SPARKET_CHAIN__NETUID", args.netuid or 57))
 
     if not primary_hotkey:
         bt.logging.error("SPARKET_AUDITOR__PRIMARY_HOTKEY is required")
@@ -65,10 +67,29 @@ def main() -> None:
         bt.logging.error("SPARKET_AUDITOR__PRIMARY_URL is required")
         sys.exit(1)
 
-    # Initialize bittensor components
-    wallet = bt.wallet(config=config)
-    subtensor = bt.subtensor(config=config)
-    netuid = config.netuid or 57
+    # Wallet name/hotkey from env or CLI
+    wallet_name = os.environ.get("SPARKET_WALLET__NAME", getattr(args, "wallet.name", "default"))
+    wallet_hotkey = os.environ.get("SPARKET_WALLET__HOTKEY", getattr(args, "wallet.hotkey", "default"))
+
+    # Initialize bittensor components (v10 API)
+    wallet = bt.Wallet(name=wallet_name, hotkey=wallet_hotkey)
+
+    # Build subtensor config from env or CLI
+    chain_endpoint = os.environ.get(
+        "SPARKET_CHAIN__ENDPOINT",
+        getattr(args, "subtensor.chain_endpoint", None),
+    )
+    network = os.environ.get(
+        "SPARKET_SUBTENSOR__NETWORK",
+        getattr(args, "subtensor.network", None),
+    )
+    if chain_endpoint:
+        subtensor = bt.Subtensor(network=chain_endpoint)
+    elif network:
+        subtensor = bt.Subtensor(network=network)
+    else:
+        subtensor = bt.Subtensor()
+
     metagraph = subtensor.metagraph(netuid=netuid)
 
     bt.logging.info({
