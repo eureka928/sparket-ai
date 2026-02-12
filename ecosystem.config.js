@@ -107,7 +107,7 @@ module.exports = {
       // Auto-restart configuration
       autorestart: true,
       watch: false,
-      max_memory_restart: '2G',
+      max_memory_restart: '8G',
       
       // Restart behavior
       min_uptime: '10s',

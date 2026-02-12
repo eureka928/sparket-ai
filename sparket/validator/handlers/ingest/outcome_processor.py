@@ -164,7 +164,7 @@ async def run_outcome_processing_if_due(
                     params={
                         "market_id": market["market_id"],
                         "settled_at": created_at,
-                        "result": market_result,
+                        "result": market_result.upper(),
                         "score_home": score_home,
                         "score_away": score_away,
                         "details": details,

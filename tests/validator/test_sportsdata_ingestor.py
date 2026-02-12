@@ -307,6 +307,64 @@ async def _schedule_tracks_only_window(monkeypatch):
     assert (LeagueCode.NFL, 51) not in ingestor.tracked_events
 
 
+def test_refresh_schedule_uses_line_history_scores_for_nfl(monkeypatch):
+    asyncio.run(_refresh_schedule_uses_line_history_scores_for_nfl(monkeypatch))
+
+
+async def _refresh_schedule_uses_line_history_scores_for_nfl(monkeypatch):
+    now = datetime(2026, 2, 12, 12, 0, tzinfo=timezone.utc)
+    final_game = Game.model_validate(
+        {
+            "GameID": 19098,
+            "Season": 2025,
+            "SeasonType": "Regular",
+            "Date": (now - timedelta(days=2)).isoformat(),
+            "Status": "Final",
+            "HomeTeam": "LV",
+            "AwayTeam": "LAC",
+            # No HomeScore/AwayScore in NFL SchedulesBasic payload.
+        }
+    )
+    odds_with_score = GameOddsSet.model_validate(
+        {
+            "GameID": 19098,
+            "Status": "Final",
+            "HomeTeamScore": 9,
+            "AwayTeamScore": 20,
+            "PregameOdds": [],
+        }
+    )
+    client = FakeClient([final_game], {19098: odds_with_score})
+    config = SportsDataIOConfig(leagues=[base_league_config()])
+    class DbForStatus(StubDatabase):
+        async def write(self, *_, **__):
+            return 0
+    ingestor = SportsDataIngestor(database=DbForStatus(), client=client, config=config)
+    state = next(iter(ingestor.leagues.values()))
+    state.league_id = 22
+    state.team_index = {"LV": 1, "LAC": 2}
+
+    async def fake_ensure_event(database, event_row):
+        gid = event_row["ext_ref"]["sportsdataio"]["GameID"]
+        return gid, event_row["start_time_utc"]
+
+    captured: list[tuple[int | None, int | None]] = []
+
+    async def fake_record(self, event_id, game, home_team_id, away_team_id, *, home_score_override=None, away_score_override=None):
+        captured.append((home_score_override, away_score_override))
+        return 0
+
+    monkeypatch.setattr(
+        "sparket.validator.services.sportsdata_ingestor.ensure_event_for_sdio",
+        fake_ensure_event,
+    )
+    monkeypatch.setattr(SportsDataIngestor, "_record_outcomes", fake_record)
+
+    inserted = await ingestor._refresh_schedule(state, now)
+    assert inserted == 1
+    assert captured == [(9, 20)]
+
+
 def test_tracks_games_across_leagues(monkeypatch):
     asyncio.run(_tracks_games_across_leagues(monkeypatch))
 
@@ -739,4 +797,137 @@ async def _post_start_finalizes_and_records_closing(monkeypatch):
 
     await ingestor._capture_snapshot(state, tracked, now + timedelta(minutes=1), metrics=metrics)
     assert (LeagueCode.NFL, tracked.game_id) not in ingestor.tracked_events
+
+
+def test_soccer_final_variants_are_treated_as_finished():
+    config = SportsDataIOConfig(leagues=[base_league_config()])
+    ingestor = SportsDataIngestor(database=StubDatabase(), client=FakeClient([], []), config=config)
+
+    final_aet = Game.model_validate(
+        {
+            "GameID": 501,
+            "Season": 2026,
+            "SeasonType": "Regular",
+            "Date": "2026-05-18T20:00:00Z",
+            "Status": "FinalAET",
+            "HomeTeam": "MAN",
+            "AwayTeam": "LIV",
+        }
+    )
+    final_pen = Game.model_validate(
+        {
+            "GameID": 502,
+            "Season": 2026,
+            "SeasonType": "Regular",
+            "Date": "2026-05-18T20:00:00Z",
+            "Status": "FinalPEN",
+            "HomeTeam": "MAN",
+            "AwayTeam": "LIV",
+        }
+    )
+
+    assert ingestor._is_game_final(final_aet) is True
+    assert ingestor._is_game_final(final_pen) is True
+    assert ingestor._game_status_to_event_status(final_aet) == "finished"
+    assert ingestor._game_status_to_event_status(final_pen) == "finished"
+
+
+def test_resolve_team_id_supports_casefold_alias():
+    index = {
+        "BVB": 1,
+        "bayer 04 leverkusen": 2,
+        "532": 3,
+    }
+    assert SportsDataIngestor._resolve_team_id(index, "BVB") == 1
+    assert SportsDataIngestor._resolve_team_id(index, "BAYER 04 LEVERKUSEN") == 2
+    assert SportsDataIngestor._resolve_team_id(index, "532") == 3
+    assert SportsDataIngestor._resolve_team_id(index, "unknown") is None
+
+
+def test_resolve_market_result_moneyline_no_signature_errors():
+    config = SportsDataIOConfig(leagues=[base_league_config()])
+    ingestor = SportsDataIngestor(database=StubDatabase(), client=FakeClient([], []), config=config)
+
+    assert (
+        ingestor._resolve_market_result(
+            kind="MONEYLINE",
+            line=None,
+            points_team_id=None,
+            home_team_id=1,
+            away_team_id=2,
+            home_score=20,
+            away_score=17,
+        )
+        == "home"
+    )
+    assert (
+        ingestor._resolve_market_result(
+            kind="MONEYLINE",
+            line=None,
+            points_team_id=None,
+            home_team_id=1,
+            away_team_id=2,
+            home_score=17,
+            away_score=20,
+        )
+        == "away"
+    )
+
+
+def test_upsert_event_resolves_soccer_keys_and_patches(monkeypatch):
+    asyncio.run(_upsert_event_resolves_soccer_keys_and_patches(monkeypatch))
+
+
+async def _upsert_event_resolves_soccer_keys_and_patches(monkeypatch):
+    now = datetime(2026, 2, 14, 14, 30, tzinfo=timezone.utc)
+    game = Game.model_validate(
+        {
+            "GameId": 93686,
+            "Season": 2026,
+            "SeasonType": "Regular",
+            "DateTime": now.isoformat(),
+            "Status": "Scheduled",
+            "HomeTeamName": "BV Borussia 09 Dortmund",
+            "AwayTeamName": "1. FSV Mainz 05",
+            "HomeTeamKey": "BVB",
+            "AwayTeamKey": "MAI",
+            "HomeTeamId": 532,
+            "AwayTeamId": 528,
+        }
+    )
+    config = SportsDataIOConfig(leagues=[base_league_config()])
+    ingestor = SportsDataIngestor(database=StubDatabase(), client=FakeClient([], []), config=config)
+
+    class CaptureDatabase(StubDatabase):
+        def __init__(self):
+            self.calls = []
+
+        async def write(self, query, params=None, **kwargs):
+            self.calls.append(params or {})
+            return 0
+
+    capture_db = CaptureDatabase()
+    ingestor.database = capture_db
+
+    state = next(iter(ingestor.leagues.values()))
+    state.league_id = 22
+    team_index = {"BVB": 101, "MAI": 102}
+
+    async def fake_ensure_event_for_sdio(database, event_row):
+        return 7001, event_row["start_time_utc"]
+
+    monkeypatch.setattr(
+        "sparket.validator.services.sportsdata_ingestor.ensure_event_for_sdio",
+        fake_ensure_event_for_sdio,
+    )
+
+    event_id, _, home_id, away_id = await ingestor._upsert_event(state, game, team_index)
+
+    assert event_id == 7001
+    assert home_id == 101
+    assert away_id == 102
+    assert capture_db.calls
+    assert capture_db.calls[0]["event_id"] == 7001
+    assert capture_db.calls[0]["home_team_id"] == 101
+    assert capture_db.calls[0]["away_team_id"] == 102
 

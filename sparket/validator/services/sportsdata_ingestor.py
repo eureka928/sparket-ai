@@ -20,11 +20,10 @@ from sparket.providers.sportsdataio import (
     map_moneyline_quotes,
     map_spread_quotes,
     map_total_quotes,
-    resolve_moneyline_result,
     resolve_spread_result,
     resolve_total_result,
 )
-from sparket.providers.sportsdataio.catalog import team_rows_from_catalog, build_team_index_by_sdio
+from sparket.providers.sportsdataio.catalog import team_rows_from_catalog
 from sparket.providers.sportsdataio.enums import GameStatus
 from sparket.providers.sportsdataio.types import Game, GameOdds, GameOddsSet, Team
 from sparket.validator.database.resolver import ensure_event_for_sdio, ensure_market
@@ -36,6 +35,15 @@ from sparket.shared.rows import ProviderQuoteRow
 _UPDATE_EVENT_STATUS = text("""
     UPDATE event SET status = :status
     WHERE event_id = :event_id AND status != :status
+""")
+
+_PATCH_EVENT_TEAMS = text("""
+    UPDATE event
+    SET
+        home_team_id = COALESCE(home_team_id, :home_team_id),
+        away_team_id = COALESCE(away_team_id, :away_team_id)
+    WHERE event_id = :event_id
+      AND (home_team_id IS NULL OR away_team_id IS NULL)
 """)
 
 _SELECT_MARKETS_FOR_EVENT = text("""
@@ -114,6 +122,15 @@ class OddsCacheEntry:
 
 
 TrackedKey = Tuple[LeagueCode, int]
+FINAL_GAME_STATUSES = {
+    GameStatus.FINAL,
+    GameStatus.FINAL_OT,
+    GameStatus.FINAL_SO,
+    GameStatus.FINAL_AET,
+    GameStatus.FINAL_PEN,
+    GameStatus.AWARDED,
+    GameStatus.FORFEIT,
+}
 
 
 class SportsDataIngestor:
@@ -144,6 +161,7 @@ class SportsDataIngestor:
         }
         self.tracked_events: Dict[TrackedKey, TrackedEvent] = {}
         self._odds_cache: Dict[Tuple[LeagueCode, int], OddsCacheEntry] = {}
+        self._outcome_score_missing_logged: Set[int] = set()
 
     async def close(self) -> None:
         self._odds_cache.clear()
@@ -325,14 +343,59 @@ class SportsDataIngestor:
     async def _load_team_index(self, league_id: int) -> Dict[str, int]:
         query = text(
             """
-            select team_id, ext_ref->'sportsdataio'->>'Key' as team_key
+            select
+                team_id,
+                name,
+                ext_ref->'sportsdataio'->>'Key' as team_key,
+                ext_ref->'sportsdataio'->>'TeamID' as team_sdio_id
             from team
             where league_id = :league_id
             """
         )
         rows = await self.database.read(query, params={"league_id": league_id}, mappings=True)
-        rows = [{"team_id": r["team_id"], "ext_ref": {"sportsdataio": {"Key": r["team_key"]}}} for r in rows if r.get("team_key")]
-        return build_team_index_by_sdio(rows)
+        index: Dict[str, int] = {}
+        for row in rows:
+            team_id = int(row["team_id"])
+            aliases = (
+                row.get("team_key"),
+                row.get("name"),
+                row.get("team_sdio_id"),
+            )
+            for alias in aliases:
+                if alias is None:
+                    continue
+                key = str(alias).strip()
+                if not key:
+                    continue
+                index.setdefault(key, team_id)
+                index.setdefault(key.casefold(), team_id)
+        return index
+
+    @staticmethod
+    def _resolve_team_id(team_index: Dict[str, int], team_ref: Optional[str]) -> Optional[int]:
+        if team_ref is None:
+            return None
+        token = str(team_ref).strip()
+        if not token:
+            return None
+        return team_index.get(token) or team_index.get(token.casefold())
+
+    async def _patch_event_teams(
+        self,
+        event_id: int,
+        home_team_id: Optional[int],
+        away_team_id: Optional[int],
+    ) -> None:
+        if home_team_id is None and away_team_id is None:
+            return
+        await self.database.write(
+            _PATCH_EVENT_TEAMS,
+            params={
+                "event_id": event_id,
+                "home_team_id": home_team_id,
+                "away_team_id": away_team_id,
+            },
+        )
 
     async def _refresh_schedule(self, state: LeagueState, now: datetime) -> int:
         if state.config.schedule_mode == "season":
@@ -363,7 +426,15 @@ class SportsDataIngestor:
                 # Record outcomes for final games regardless of status change
                 # (_record_outcomes has idempotency guards via _CHECK_OUTCOME_EXISTS)
                 if self._is_game_final(game):
-                    recorded = await self._record_outcomes(event_id, game, home_id, away_id)
+                    resolved_home, resolved_away = await self._resolve_final_scores(state, game, now)
+                    recorded = await self._record_outcomes(
+                        event_id,
+                        game,
+                        home_id,
+                        away_id,
+                        home_score_override=resolved_home,
+                        away_score_override=resolved_away,
+                    )
                     outcomes_recorded += recorded
             except Exception as e:
                 bt.logging.warning({"sdio_status_sync_error": str(e), "event_id": event_id})
@@ -476,10 +547,11 @@ class SportsDataIngestor:
     ) -> Tuple[int, datetime, Optional[int], Optional[int]]:
         if not game.date_time:
             raise ValueError("game missing date_time")
-        home_id = team_index.get(game.home_team)
-        away_id = team_index.get(game.away_team)
+        home_id = self._resolve_team_id(team_index, game.home_team)
+        away_id = self._resolve_team_id(team_index, game.away_team)
         event_row = map_game_to_event(game, league_id=state.league_id, home_team_id=home_id, away_team_id=away_id)
         event_id, start_time = await ensure_event_for_sdio(self.database, event_row)
+        await self._patch_event_teams(event_id, home_id, away_id)
         if start_time.tzinfo is None:
             start_time = start_time.replace(tzinfo=timezone.utc)
         return event_id, start_time, home_id, away_id
@@ -491,11 +563,23 @@ class SportsDataIngestor:
         """Check if game is in a final/completed state."""
         if game.status is None:
             return False
-        return game.status in (
-            GameStatus.FINAL,
-            GameStatus.FINAL_OT,
-            GameStatus.FINAL_SO,
-        )
+        return game.status in FINAL_GAME_STATUSES
+
+    async def _resolve_final_scores(
+        self,
+        state: LeagueState,
+        game: Game,
+        now: datetime,
+    ) -> Tuple[Optional[int], Optional[int]]:
+        if game.home_score is not None and game.away_score is not None:
+            return game.home_score, game.away_score
+        try:
+            odds_set = await self._get_line_history_for_event(state, game.game_id, now, tracked=None)
+        except Exception:
+            return game.home_score, game.away_score
+        if odds_set is None:
+            return game.home_score, game.away_score
+        return odds_set.home_score, odds_set.away_score
 
     def _game_status_to_event_status(self, game: Game) -> str:
         """Map SDIO game status to our event status."""
@@ -507,6 +591,10 @@ class SportsDataIngestor:
             GameStatus.FINAL: "finished",
             GameStatus.FINAL_OT: "finished",
             GameStatus.FINAL_SO: "finished",
+            GameStatus.FINAL_AET: "finished",
+            GameStatus.FINAL_PEN: "finished",
+            GameStatus.AWARDED: "finished",
+            GameStatus.FORFEIT: "finished",
             GameStatus.POSTPONED: "postponed",
             GameStatus.CANCELED: "canceled",
         }
@@ -536,19 +624,29 @@ class SportsDataIngestor:
         game: Game,
         home_team_id: Optional[int],
         away_team_id: Optional[int],
+        *,
+        home_score_override: Optional[int] = None,
+        away_score_override: Optional[int] = None,
     ) -> int:
         """Record outcomes for all markets of a finished game. Returns count recorded."""
-        if game.home_score is None or game.away_score is None:
-            bt.logging.debug({
-                "sdio_outcome_skip": {
-                    "event_id": event_id,
-                    "reason": "scores_not_available",
-                }
-            })
+        missing_logged = getattr(self, "_outcome_score_missing_logged", None)
+        if missing_logged is None:
+            missing_logged = set()
+            self._outcome_score_missing_logged = missing_logged
+        home_score = game.home_score if home_score_override is None else home_score_override
+        away_score = game.away_score if away_score_override is None else away_score_override
+        if home_score is None or away_score is None:
+            if event_id not in missing_logged:
+                bt.logging.debug({
+                    "sdio_outcome_skip": {
+                        "event_id": event_id,
+                        "reason": "scores_not_available",
+                    }
+                })
+                missing_logged.add(event_id)
             return 0
 
-        home_score = game.home_score
-        away_score = game.away_score
+        missing_logged.discard(event_id)
         settled_at = datetime.now(timezone.utc)
 
         # Get all markets for this event
@@ -602,7 +700,7 @@ class SportsDataIngestor:
                     params={
                         "market_id": market_id,
                         "settled_at": settled_at,
-                        "result": result,
+                        "result": result.upper(),
                         "score_home": home_score,
                         "score_away": away_score,
                         "details": json.dumps({
@@ -655,7 +753,11 @@ class SportsDataIngestor:
         kind_upper = kind.upper() if kind else ""
 
         if kind_upper == "MONEYLINE":
-            return resolve_moneyline_result(home_score, away_score)
+            if home_score > away_score:
+                return "home"
+            if home_score < away_score:
+                return "away"
+            return "draw"
         elif kind_upper == "TOTAL" and line is not None:
             return resolve_total_result(line, home_score, away_score)
         elif kind_upper == "SPREAD" and line is not None:

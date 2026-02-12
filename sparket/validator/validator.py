@@ -809,6 +809,72 @@ class BaseValidatorNeuron(BaseNeuron):
         self._sdio_ingest_running = False
         bt.logging.info({"sdio_background_loop": "stopped"})
 
+    # -------------------------------------------------------------------------
+    # Ledger Export (decoupled from scoring path)
+    # -------------------------------------------------------------------------
+
+    _ledger_export_step_interval: int = 25  # same cadence as main scoring
+    _last_ledger_export_step: int = -1
+
+    async def _run_ledger_export_if_due(self) -> None:
+        """Export ledger checkpoint + delta if enabled and due.
+
+        Runs independently of the scoring execution path (in-process vs worker)
+        so that auditors always have fresh data.
+        """
+        if not bool(os.environ.get("SPARKET_LEDGER__ENABLED", "").lower() in ("true", "1", "yes")):
+            return
+
+        # Same cadence as scoring
+        try:
+            timers = getattr(getattr(self.app_config, "core", None), "timers", None)
+            interval = int(getattr(timers, "main_score_steps", 25)) if timers else 25
+        except Exception:
+            interval = 25
+
+        if interval <= 0 or (self.step % interval != 0):
+            return
+
+        # Skip if we already exported this step
+        if self.step == self._last_ledger_export_step:
+            return
+        self._last_ledger_export_step = self.step
+
+        from sparket.validator.ledger.exporter import LedgerExporter
+        from sparket.validator.ledger.store.filesystem import FilesystemStore
+        from sqlalchemy import text
+
+        data_dir = os.environ.get("SPARKET_LEDGER__DATA_DIR", "sparket/data/ledger")
+        netuid = getattr(self.config, "netuid", 57)
+
+        exporter = LedgerExporter(database=self.dbm, wallet=self.wallet, netuid=netuid)
+        store = FilesystemStore(data_dir=data_dir)
+
+        # Always export checkpoint (accumulator state from DB)
+        checkpoint = await exporter.export_checkpoint()
+        await store.put_checkpoint(checkpoint)
+
+        # Export delta if there are new settled outcomes since last delta
+        rows = await self.dbm.read(
+            text("SELECT last_delta_at FROM ledger_state WHERE id = 1"),
+            mappings=True,
+        )
+        last_delta_at = rows[0]["last_delta_at"] if rows else None
+
+        from datetime import datetime, timezone, timedelta
+        since = last_delta_at or (datetime.now(timezone.utc) - timedelta(hours=12))
+        delta = await exporter.export_delta(since=since)
+        if delta.settled_submissions:
+            await store.put_delta(delta)
+
+        bt.logging.info({
+            "ledger_export": {
+                "step": self.step,
+                "checkpoint_miners": len(checkpoint.accumulators),
+                "delta_submissions": len(delta.settled_submissions),
+            }
+        })
+
     def run(self):
         """
         Initiates and manages the main loop for the miner on the Bittensor network. The main loop handles graceful shutdown on keyboard interrupts and logs unforeseen errors.
@@ -970,6 +1036,21 @@ class BaseValidatorNeuron(BaseNeuron):
                     except asyncio.TimeoutError:
                         bt.logging.warning({"validator_loop": {"phase": "outcome_process_timeout"}})
                     bt.logging.debug({"validator_loop": {"phase": "outcome_process_complete"}})
+
+                    # Ledger export (independent of scoring path)
+                    bt.logging.debug({"validator_loop": {"phase": "ledger_export_start"}})
+                    try:
+                        self.loop.run_until_complete(
+                            asyncio.wait_for(
+                                self._run_ledger_export_if_due(),
+                                timeout=timeouts.get("scoring", 120),
+                            )
+                        )
+                    except asyncio.TimeoutError:
+                        bt.logging.warning({"validator_loop": {"phase": "ledger_export_timeout"}})
+                    except Exception as e:
+                        bt.logging.warning({"validator_loop": {"ledger_export_error": str(e)}})
+                    bt.logging.debug({"validator_loop": {"phase": "ledger_export_complete"}})
 
                     from sparket.validator.handlers.maintenance.cleanup import run_cleanup_if_due
 
